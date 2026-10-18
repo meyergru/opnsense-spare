@@ -374,6 +374,7 @@ def maintenance_export(cfg, dest):
                         # Hard-link the existing inode without removing its live pathname.
                         # Exclusive creation refuses to overwrite an existing backup.
                         os.link(dest, backup, follow_symlinks=False)
+                        os.chmod(backup, 0o600)
                         print(f"Previous transfer file archived: {backup}")
                     validate_export_destination(dest)
                     os.replace(staged, dest)
@@ -481,11 +482,10 @@ def main():
 
         # Preparation is safe to repeat, even after an intervening manual boot.
         # Do not start a VM after an unsuccessful or only partly applied qm set.
-        # Verify PVE's configured storage path before modifying even the ISO.
-        name = iso_name(cfg, args.mode)
-        verify_iso_storage(cfg, name)
         ident, name, iso = make_iso(cfg, args.mode,
                                     transfer if args.mode == "emergency" else None)
+        # Verify the PVE volume maps to the freshly generated file before qm mutation.
+        verify_iso_storage(cfg, name)
         try:
             qemu_net(cfg, networks)
             run("qm", "set", vmid, "--ide2", f"{cfg['iso_storage']}:iso/{name},media=cdrom")
