@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Proxmox controller for a universal OPNsense cold spare (V6).
+"""Proxmox controller for a universal OPNsense cold spare.
 
 No background daemon; requires a stopped VM for every mode change.
 See README.md before using on a production host.
@@ -471,7 +471,7 @@ def main():
             die("Previous transition incomplete; use --recover-incomplete only after inspection")
         if state.get("prepared"):
             # V5 stored net0/net1 at the top level; accept only a matching
-            # two-interface V6 configuration, then verify actual VM hardware.
+            # two-interface configuration, then verify actual VM hardware.
             if "networks" not in state["prepared"]:
                 if set(nic_keys(cfg)) != {"net0", "net1"}:
                     die("Old prepared state has different NIC count; manual inspection required")

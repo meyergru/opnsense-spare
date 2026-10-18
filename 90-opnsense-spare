@@ -1,7 +1,7 @@
 #!/bin/sh
 # OPNsense /usr/local/etc/rc.syshook.d/import/90-opnsense-spare
 # FreeBSD /bin/sh; called before network configuration. Fail closed on missing media.
-# V6: interface names are provided on the ISO and applied at EVERY boot.
+# Interface names are provided on the ISO and applied at EVERY boot.
 set -eu
 umask 077
 

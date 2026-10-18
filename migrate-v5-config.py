@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Convert a V5 host JSON to V6; does not mutate input or Proxmox VM.
+"""Convert a legacy two-interface host JSON to the universal schema; does not mutate input or Proxmox VM.
 
 Example: ./migrate-v5-config.py /etc/opnsense-spare.json \
-  --name vtnet0=ix1 --name vtnet1=igc3 -o /etc/opnsense-spare-v6.json
+  --name vtnet0=ix1 --name vtnet1=igc3 -o /etc/opnsense-spare-new.json
 """
 import argparse
 import json
@@ -12,7 +12,7 @@ from pathlib import Path
 
 def convert(old, names):
     if 'networks' in old:
-        raise ValueError('Input already appears to be V6')
+        raise ValueError('Input already appears to use the universal schema')
     slots = []
     for k in old:
         m = re.fullmatch(r'net(\d+)_(?:maintenance|emergency)', k)
@@ -60,7 +60,7 @@ def main():
     with dst_path.open('x') as fd:
         fd.write(json.dumps(cfg, ensure_ascii=False, indent=2) + '\n')
     dst_path.chmod(0o600)
-    print(f'Created {dst_path}; review profile and install guest V6 hook before starting VM.')
+    print(f'Created {dst_path}; review profile and install the current guest hook before starting VM.')
 
 if __name__ == '__main__':
     main()

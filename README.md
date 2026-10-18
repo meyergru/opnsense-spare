@@ -2,7 +2,7 @@
 
 A **cold standby OPNsense virtual machine** that can temporarily replace a physical OPNsense firewall, while normally operating as an independent maintenance client. The project is **not** a CARP/pfsync high-availability cluster and does not provide automatic failover.
 
-> **Development status — V6:** Python unit tests and shell syntax checks have passed, but **V6 has not yet undergone a complete OPNsense/FreeBSD and Proxmox integration test**. In particular, the consolidated import hook's NIC renaming and the end-to-end WAN and failback operations must be verified on the target system before relying on it for disaster recovery. Keep a working backup and out-of-band console access.
+> **Development status:** Python unit tests and shell syntax checks have passed, but **the current implementation has not yet undergone a complete OPNsense/FreeBSD and Proxmox integration test**. In particular, the consolidated import hook's NIC renaming and the end-to-end WAN and failback operations must be verified on the target system before relying on it for disaster recovery. Keep a working backup and out-of-band console access.
 
 ## How it works
 
@@ -47,7 +47,7 @@ For a physical firewall with `igc0` (untagged LAN), `igc1` (tagged VLAN trunk), 
 
 ### Preserve the physical interface names *and* MAC addresses
 
-A restored physical OPNsense `config.xml` refers to the original interface names (for example `ix1` and `igc3`), not to Proxmox VirtIO names (`vtnet0`, `vtnet1`). To avoid modifying every imported configuration, V6 performs a **temporary FreeBSD interface rename on every guest boot**, *before* OPNsense configures networking:
+A restored physical OPNsense `config.xml` refers to the original interface names (for example `ix1` and `igc3`), not to Proxmox VirtIO names (`vtnet0`, `vtnet1`). To avoid modifying every imported configuration, the guest hook performs a **temporary FreeBSD interface rename on every guest boot**, *before* OPNsense configures networking:
 
 ```text
 PVE net0 -> FreeBSD vtnet0 -> ifconfig name ix1  -> OPNsense config.xml: ix1
@@ -65,7 +65,7 @@ MAC addresses are a *separate* setting. In each `networks.emergency.netN` string
 | `networks.maintenance.netN: virtio=...` | Independent maintenance MAC | Generate a unique locally administered MAC |
 | `networks.*.netN: bridge=...` | Layer-2 path of that interface | Your PVE bridges and switch/port layout |
 
-**Before the first V6 boot:** the VM's saved maintenance `config.xml` may still refer to `vtnet0`. Once the hook renames it to the physical name, that old assignment will no longer work. Prepare to reassign the maintenance interface using the **PVE console** to the renamed interface (e.g. `ix1`), configure its independent LAN IP/gateway, and verify it again after reboot. Never depend on SSH alone for this initial transition.
+**Before the first boot with interface renaming enabled:** the VM's saved maintenance `config.xml` may still refer to `vtnet0`. Once the hook renames it to the physical name, that old assignment will no longer work. Prepare to reassign the maintenance interface using the **PVE console** to the renamed interface (e.g. `ix1`), configure its independent LAN IP/gateway, and verify it again after reboot. Never depend on SSH alone for this initial transition.
 
 ### VLAN transport is optional
 
@@ -130,14 +130,14 @@ The optional `--transfer` path refers to a **file on the PVE host**, not inside 
 - **Never run the physical firewall and a network-connected emergency VM simultaneously** with overlapping production IP/MAC addresses.
 - Emergency switching is manual by design. `onboot=0` is enforced.
 - Validate the PVE bridge wiring, VLAN tagging/untagging, WAN connectivity (DHCP or PPPoE), gateway, routing, DHCP, VPN, and firewall behavior for *your* topology.
-- The mode ISO may contain a complete firewall configuration, **including secrets**. The controller creates the ISO with permission `0600`; protect PVE backups, snapshots, transfer files, and any old ISO images accordingly. Never commit real `config.xml` or `state.json` data.
+- The mode ISO may contain a complete firewall configuration, **including secrets**. The controller creates the ISO with permission `0600`; protect PVE backups, snapshots, transfer files, and any old ISO images accordingly.
 - The guest hook fails closed on absent/invalid media, invalid mapping, source-name conflicts, or an interrupted profile transition. This may halt the VM and require console recovery.
 - An older EFI loader can fail before OPNsense hooks run. Verify loader compatibility after major upgrades.
 
 ## Tests and status
 
 ```sh
-python3 -m unittest -v test_host test_v6
+python3 -m unittest -v test_host test_networks
 python3 -m py_compile opnsense-spare migrate-v5-config.py
 sh -n 90-opnsense-spare
 ```
@@ -152,7 +152,6 @@ The automated tests exercise controller state transitions, imports/exports, ISO 
 | `90-opnsense-spare` | Single OPNsense guest import hook (FreeBSD `/bin/sh`) |
 | `opnsense-spare.json.example` | Example two-NIC configuration |
 | `opnsense-spare-three-nic.json.example` | Example three-NIC topology |
-| `test_host.py`, `test_v6.py` | Unit and regression tests |
-| `CHANGELOG-V5.md`, `CHANGELOG-V6.md` | Development history |
+| `test_host.py`, `test_networks.py` | Unit and regression tests |
+| `CHANGELOG.md` | Development history |
 
-**No live configuration, private keys, or production secrets belong in the Git repository.**

@@ -1,4 +1,4 @@
-"""V6-specific regression tests (generic NICs and early guest mapping)."""
+"""Regression tests for generic NICs and early guest mapping (generic NICs and early guest mapping)."""
 import importlib.machinery
 import importlib.util
 import hashlib
@@ -114,7 +114,7 @@ class UniversalTopologyTest(unittest.TestCase):
             def fake_make(cfg,mode,src):
                 name=spare.iso_name(cfg,mode)
                 path=root/name
-                path.write_bytes(b'simulated-v6-iso')
+                path.write_bytes(b'simulated-mode-iso')
                 return ('f'*32,name,path)
             argv=['opnsense-spare','emergency','--link-down','--config',str(cfgpath)]
             with patch.object(spare.sys,'argv',argv), patch.object(spare.os,'geteuid',return_value=0), \
