@@ -11,12 +11,14 @@ MOUNT=/mnt/opnsense-spare
 MOUNTED=0
 
 fail() {
-    echo "SPARE-BOOT FATAL: $*" >/dev/console
+    # Do not let diagnostics, unmount, or shutdown errors exit the hook.
+    # rc.syshook does not necessarily stop boot when a hook exits nonzero.
+    trap - EXIT
+    echo "SPARE-BOOT FATAL: $*" >/dev/console || :
     logger -t opnsense-spare "SPARE-BOOT FATAL: $*" || :
     [ "$MOUNTED" -eq 0 ] || umount "$MOUNT" || :
-    /sbin/halt -p
-    # rc.syshook failures do not stop OPNsense boot; never return on error.
-    while :; do sleep 3600; done
+    /sbin/halt -p || :
+    while :; do sleep 3600 || :; done
 }
 
 if [ "${1:-}" = "init" ]; then
@@ -32,6 +34,10 @@ if [ "${1:-}" = "init" ]; then
     echo "Maintenance profile initialized. Attach the mode ISO before the next boot."
     exit 0
 fi
+
+# Catch unexpected failures under set -e (including failed chmod/mv/write).
+# Set only for boot, not for the explicit one-time 'init' command.
+trap 'fail "Unexpected boot hook exit"' EXIT
 
 [ -f "$STORE/active-mode" ] || fail "Not initialized: $STORE/active-mode is missing"
 [ ! -e "$STORE/transition" ] || fail "Interrupted profile transition; inspect manually"
@@ -113,8 +119,10 @@ echo "SPARE-BOOT: $COUNT network interfaces renamed"
 # The request ID makes booting repeatedly with the same ISO idempotent.
 if [ -f "$STORE/last-request" ] && [ "$(cat "$STORE/last-request")" = "$IDENT" ]; then
     [ "$OLD" = "$MODE" ] || fail "Same request ID but conflicting mode"
-    umount "$MOUNT"
+    umount "$MOUNT" || fail "Could not unmount mode ISO"
+    MOUNTED=0
     echo "SPARE-BOOT: Repeated boot in $MODE, config.xml remains unchanged"
+    trap - EXIT
     exit 0
 fi
 
@@ -144,8 +152,14 @@ if [ "$MODE" != "$OLD" ] || [ "$IMPORT" = 1 ]; then
         # Preserve an earlier emergency configuration before replacing it.
         if [ -s "$STORE/emergency.xml" ]; then
             mkdir -p "$STORE/archive"
-            cp "$STORE/emergency.xml" "$STORE/archive/emergency-before-$IDENT.xml" || fail "Could not archive previous emergency profile"
-            chmod 600 "$STORE/archive/emergency-before-$IDENT.xml"
+            ARCHIVE="$STORE/archive/emergency-before-$IDENT.xml"
+            if [ ! -e "$ARCHIVE" ]; then
+                cp "$STORE/emergency.xml" "$ARCHIVE.new" || fail "Could not stage previous emergency profile"
+                chmod 600 "$ARCHIVE.new"
+                # Atomic no-overwrite commit: retries cannot clobber the first recovery copy.
+                ln "$ARCHIVE.new" "$ARCHIVE" || fail "Could not commit emergency recovery archive"
+                rm -f "$ARCHIVE.new"
+            fi
         fi
         cp "$MOUNT/config.xml" "$STORE/emergency.xml.new" || fail "Import copy failed"
         chmod 600 "$STORE/emergency.xml.new"
@@ -157,12 +171,19 @@ if [ "$MODE" != "$OLD" ] || [ "$IMPORT" = 1 ]; then
     mv -f "$ACTIVE.new" "$ACTIVE"
     printf '%s\n' "$MODE" > "$STORE/active-mode.new"
     mv -f "$STORE/active-mode.new" "$STORE/active-mode"
+    # Commit the request while the transition marker still blocks a reboot.
+    # Crash after this commit but before marker removal must fail closed.
+    printf '%s\n' "$IDENT" > "$STORE/last-request.new"
+    mv -f "$STORE/last-request.new" "$STORE/last-request"
     rm -f "$STORE/transition"
+else
+    # Same mode, new request without an import: no profile transaction.
+    printf '%s\n' "$IDENT" > "$STORE/last-request.new"
+    mv -f "$STORE/last-request.new" "$STORE/last-request"
 fi
 
-printf '%s\n' "$IDENT" > "$STORE/last-request.new"
-mv -f "$STORE/last-request.new" "$STORE/last-request"
-umount "$MOUNT"
+umount "$MOUNT" || fail "Could not unmount mode ISO"
 MOUNTED=0
 echo "SPARE-BOOT: $OLD -> $MODE (import=$IMPORT), request=$IDENT"
+trap - EXIT
 exit 0
