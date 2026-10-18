@@ -130,7 +130,7 @@ opnsense-spare maintenance --transfer /path/to/failback.xml
 - **Isolated test:** `--link-down` disconnects *all* emergency NICs. The physical firewall may remain running. Inspect the VM through the Proxmox console.
 - **Live takeover:** `--link-up` connects emergency NICs and explicitly asks you to confirm that the physical firewall is off or isolated. The controller does not detect or perform failover automatically.
 - **Start or prepare:** A successful mode command offers to start the VM. Answer `n` to leave it stopped and **ready for a manual `qm start`**. It can later be stopped and reconfigured using the normal command; no history reconciliation is needed.
-- **Failback export:** `--transfer` with `maintenance` explicitly requests an SSH export of the saved **emergency** guest configuration *after* the maintenance VM boots. Without `--transfer`, there is no export prompt. You can also run `opnsense-spare maintenance --transfer /path/to/failback.xml` against an **already running maintenance VM**; this only exports, without modifying VM hardware. If you declined the VM start, do the export after manually starting it. Nothing is imported automatically on the physical firewall.
+- **Failback export:** Existing export destinations must be regular files (never directories or symlinks). New XML is staged before replacement; the previous export is retained as a timestamped backup.\n- **PVE storage safety:** Before changing VM hardware, the controller verifies that the generated ISO resolves to the configured PVE storage path and rejects a non-CD-ROM device at `ide2`. These checks require working `pvesm path` on the PVE host.\n- **Failback export:** `--transfer` with `maintenance` explicitly requests an SSH export of the saved **emergency** guest configuration *after* the maintenance VM boots. Without `--transfer`, there is no export prompt. You can also run `opnsense-spare maintenance --transfer /path/to/failback.xml` against an **already running maintenance VM**; this only exports, without modifying VM hardware. If you declined the VM start, do the export after manually starting it. Nothing is imported automatically on the physical firewall.
 - **Failed preparation:** `qm set` is not an atomic multi-NIC operation. The controller disables PVE autostart before changing NICs, and reads back **all** NIC definitions and the attached ISO before offering a VM start. If any operation fails, the controller will not start the VM. **Do not manually start it while partially configured**; inspect `qm config <VMID>` and rerun the desired mode command to apply the complete profile.
 
 The controller uses two stable ISO filenames (`opnsense-spare-<VMID>-maintenance.iso` and `opnsense-spare-<VMID>-emergency.iso`) and unique request IDs *inside* the ISO. Repeating preparation does not blindly reimport an earlier backup: importing requires an explicit `--transfer` on the new invocation. The guest hook still stores and selects the two persistent configurations.
@@ -143,14 +143,14 @@ The controller uses two stable ISO filenames (`opnsense-spare-<VMID>-maintenance
 - Emergency switching is manual by design. `onboot=0` is enforced.
 - Validate the PVE bridge wiring, VLAN tagging/untagging, WAN connectivity (DHCP or PPPoE), gateway, routing, DHCP, VPN, and firewall behavior for *your* topology.
 - The mode ISO may contain a complete firewall configuration, **including secrets**. The controller creates the ISO with permission `0600`; protect PVE backups, snapshots, transfer files, and any old ISO images accordingly.
-- The guest hook fails closed on absent/invalid media, invalid mapping, source-name conflicts, or an interrupted profile transition. This may halt the VM and require console recovery.
+- The guest hook fails closed on absent/invalid media, invalid mapping, source-name conflicts, unexpected boot-hook failures, or an interrupted profile transition. A transition interrupted after configuration activation requires manual investigation using the OPNsense console; the marker is intentionally not cleared automatically. This may halt the VM and require console recovery.
 - An older EFI loader can fail before OPNsense hooks run. Verify loader compatibility after major upgrades.
 
 ## Tests and status
 
 ```sh
 python3 -m unittest -v test_host test_networks
-python3 -m py_compile opnsense-spare migrate-v5-config.py
+python3 -m py_compile opnsense-spare test_host.py test_networks.py
 sh -n 90-opnsense-spare
 ```
 
