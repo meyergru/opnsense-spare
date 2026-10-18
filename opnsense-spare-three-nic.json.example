@@ -1,0 +1,30 @@
+{
+  "vmid": 999,
+  "iso_dir": "/var/lib/vz/template/iso",
+  "iso_storage": "local",
+  "state_file": "/var/lib/opnsense-spare/state.json",
+  "transfer_default": "/root/opnsense-transfer/config.xml",
+  "maintenance_ssh_host": "192.0.2.10",
+  "maintenance_ssh_user": "root",
+  "ssh_identity": null,
+  "ssh_timeout_seconds": 90,
+  "maintenance_client_nic": "net0",
+  "interface_names": {
+    "vtnet0": "igc0",
+    "vtnet1": "igc1",
+    "vtnet2": "igc3"
+  },
+  "networks": {
+    "maintenance": {
+      "net0": "virtio=02:00:00:00:10:01,bridge=vmbrLAN,firewall=0",
+      "net1": "virtio=02:00:00:00:10:02,bridge=vmbrTRUNK,link_down=1,firewall=0",
+      "net2": "virtio=02:00:00:00:10:03,bridge=vmbrWAN,link_down=1,firewall=0"
+    },
+    "emergency": {
+      "net0": "virtio=02:00:00:00:20:01,bridge=vmbrLAN,firewall=0",
+      "net1": "virtio=02:00:00:00:20:02,bridge=vmbrTRUNK,trunks=10;20;30,firewall=0",
+      "net2": "virtio=02:00:00:00:20:03,bridge=vmbrWAN,firewall=0"
+    }
+  },
+  "emergency_instructions": "Power off the physical firewall and move the WAN cable to the designated PVE WAN NIC."
+}
