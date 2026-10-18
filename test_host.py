@@ -207,17 +207,17 @@ class StatelessControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             cfg = {'iso_dir': td, 'iso_storage': 'local'}
             iso = 'opnsense-spare-999-maintenance.iso'
-            with patch.object(spare, 'run', return_value=(td+'/'+iso+'\\n').encode()):
+            with patch.object(spare, 'run', return_value=(td+'/'+iso+'\n').encode()):
                 self.assertEqual(spare.verify_iso_storage(cfg, iso), 'local:iso/'+iso)
-            with patch.object(spare, 'run', return_value=b'/wrong/location.iso\\n'):
+            with patch.object(spare, 'run', return_value=b'/wrong/location.iso\n'):
                 with self.assertRaisesRegex(RuntimeError, 'ISO storage mismatch'):
                     spare.verify_iso_storage(cfg, iso)
 
     def test_non_cdrom_ide2_rejected(self):
-        spare.verify_optical_slot('ide2: local:iso/test.iso,media=cdrom\\n')
-        spare.verify_optical_slot('net0: virtio=02:00:00:00:00:01\\n')
+        spare.verify_optical_slot('ide2: local:iso/test.iso,media=cdrom\n')
+        spare.verify_optical_slot('net0: virtio=02:00:00:00:00:01\n')
         with self.assertRaisesRegex(RuntimeError, 'non-CD-ROM'):
-            spare.verify_optical_slot('ide2: local-lvm:vm-999-disk-0,size=8G\\n')
+            spare.verify_optical_slot('ide2: local-lvm:vm-999-disk-0,size=8G\n')
 
     def test_export_replacement_preserves_old_file_during_staging_failure(self):
         with tempfile.TemporaryDirectory() as td:
