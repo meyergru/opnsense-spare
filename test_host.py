@@ -231,7 +231,7 @@ class StatelessControllerTests(unittest.TestCase):
                 p.returncode = 0
                 p.stdout = bad
                 return p
-            with patch.object(spare.subprocess, 'run', side_effect=fake_ssh), \\
+            with patch.object(spare.subprocess, 'run', side_effect=fake_ssh), \
                  patch.object(spare.os, 'fdopen', side_effect=OSError('disk full')):
                 with self.assertRaisesRegex(OSError, 'disk full'):
                     spare.maintenance_export(cfg, dest)
