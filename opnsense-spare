@@ -341,6 +341,21 @@ def verify_optical_slot(actual):
         die("ide2 is occupied by a non-CD-ROM device; refusing to replace it")
 
 
+
+def ssh_nonretryable_error(returncode, stderr):
+    """Do not repeat rejected logins: retries can trigger CrowdSec SSH bans."""
+    if returncode != 255:
+        return False
+    message = stderr.lower()
+    return any(marker in message for marker in (
+        "permission denied (",
+        "too many authentication failures",
+        "authentication failed",
+        "host key verification failed",
+        "remote host identification has changed",
+    ))
+
+
 def maintenance_export(cfg, dest):
     dest = validate_export_destination(dest)
     remote = f"{cfg['maintenance_ssh_user']}@{cfg['maintenance_ssh_host']}"
@@ -397,6 +412,9 @@ def maintenance_export(cfg, dest):
                 print(f"Emergency configuration exported: {dest} (SHA256 {hashlib.sha256(raw).hexdigest()})")
                 return
             err = p.stderr.decode(errors="replace").strip()[-300:]
+            if ssh_nonretryable_error(p.returncode, err):
+                die("Export aborted: SSH authentication or host-key verification failed. "
+                    f"Not retrying to avoid lockouts. SSH: {err}")
         except subprocess.TimeoutExpired:
             err = "SSH timeout"
         time.sleep(2)
