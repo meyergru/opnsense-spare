@@ -1,0 +1,168 @@
+#!/bin/sh
+# OPNsense /usr/local/etc/rc.syshook.d/import/90-opnsense-spare
+# FreeBSD /bin/sh; called before network configuration. Fail closed on missing media.
+# V6: interface names are provided on the ISO and applied at EVERY boot.
+set -eu
+umask 077
+
+STORE=/conf/spare
+ACTIVE=/conf/config.xml
+MOUNT=/mnt/opnsense-spare
+MOUNTED=0
+
+fail() {
+    echo "SPARE-BOOT FATAL: $*" >/dev/console
+    logger -t opnsense-spare "SPARE-BOOT FATAL: $*" || :
+    [ "$MOUNTED" -eq 0 ] || umount "$MOUNT" || :
+    /sbin/halt -p
+    # rc.syshook failures do not stop OPNsense boot; never return on error.
+    while :; do sleep 3600; done
+}
+
+if [ "${1:-}" = "init" ]; then
+    # Execute ONLY once on a fully configured maintenance/client VM,
+    # before the hook is used for boot.
+    [ ! -f "$STORE/active-mode" ] || { echo "Already initialized" >&2; exit 1; }
+    [ -s "$ACTIVE" ] || { echo "/conf/config.xml not found" >&2; exit 1; }
+    mkdir -p "$STORE"
+    cp "$ACTIVE" "$STORE/maintenance.xml"
+    chmod 600 "$STORE/maintenance.xml"
+    printf 'maintenance\n' > "$STORE/active-mode"
+    chmod 600 "$STORE/active-mode"
+    echo "Maintenance profile initialized. Attach the mode ISO before the next boot."
+    exit 0
+fi
+
+[ -f "$STORE/active-mode" ] || fail "Not initialized: $STORE/active-mode is missing"
+[ ! -e "$STORE/transition" ] || fail "Interrupted profile transition; inspect manually"
+mkdir -p "$MOUNT"
+MEDIA=""
+# Never assume cd0 if other optical drives are attached.
+for dev in /dev/cd[0-9]*; do
+    [ -c "$dev" ] || continue
+    if mount -t cd9660 -o ro "$dev" "$MOUNT" 2>/dev/null; then
+        MOUNTED=1
+        if [ -r "$MOUNT/request.conf" ] && grep -qx 'magic=OPNSENSE_SPARE_V1' "$MOUNT/request.conf"; then
+            MEDIA="$dev"
+            break
+        fi
+        umount "$MOUNT" || fail "Medium $dev could not be unmounted"
+        MOUNTED=0
+    fi
+done
+[ -n "$MEDIA" ] || fail "No valid OPNsense spare ISO found"
+
+getval() {
+    sed -n "s/^$1=//p" "$MOUNT/request.conf"
+}
+MODE=$(getval mode)
+IDENT=$(getval request_id)
+IMPORT=$(getval import)
+DIGEST=$(getval sha256)
+IFMAP_DIGEST=$(getval ifmap_sha256)
+case "$MODE" in maintenance|emergency) : ;; *) fail "Invalid target mode" ;; esac
+case "$IDENT" in
+    *[!a-f0-9]*|'') fail "Invalid request ID" ;;
+esac
+[ "${#IDENT}" -eq 32 ] || fail "Incorrect request ID length"
+case "$IMPORT" in 0|1) : ;; *) fail "Invalid import flag" ;; esac
+[ "$MODE" = "emergency" ] || [ "$IMPORT" = 0 ] || fail "Import is forbidden in maintenance mode"
+
+OLD=$(cat "$STORE/active-mode")
+case "$OLD" in maintenance|emergency) : ;; *) fail "Invalid previous mode" ;; esac
+
+# Import hooks execute after the FreeBSD kernel has enumerated NICs, but
+# before OPNsense starts its network service configuration.
+# Do this on EVERY boot, including repeated request_id boots.
+[ -s "$MOUNT/interfaces.conf" ] || fail "interfaces.conf is missing or empty"
+case "$IFMAP_DIGEST" in *[!a-f0-9]*|'') fail "Invalid interface hash" ;; esac
+[ "${#IFMAP_DIGEST}" -eq 64 ] || fail "Invalid interface hash length"
+[ "$(sha256 -q "$MOUNT/interfaces.conf")" = "$IFMAP_DIGEST" ] || fail "Interface mapping SHA256 mismatch"
+
+# Validate complete mapping BEFORE renaming the first interface. All mapped
+# source NICs must exist and all target names must be free at the start.
+SEEN_SRC=" "
+SEEN_DST=" "
+COUNT=0
+while IFS='=' read -r SRC DST || [ -n "$SRC$DST" ]; do
+    case "$SRC" in
+        vtnet[0-9]*)
+            case "${SRC#vtnet}" in *[!0-9]*|'') fail "Invalid source: $SRC" ;; esac ;;
+        *) fail "Invalid source: $SRC" ;;
+    esac
+    case "$DST" in
+        ''|[!A-Za-z]*|*[!A-Za-z0-9_.-]*|vtnet*|lo[0-9]*) fail "Invalid target name: $DST" ;;
+    esac
+    case "$SEEN_SRC" in *" $SRC "*) fail "Duplicate source: $SRC" ;; esac
+    case "$SEEN_DST" in *" $DST "*) fail "Duplicate target name: $DST" ;; esac
+    SEEN_SRC="$SEEN_SRC$SRC "
+    SEEN_DST="$SEEN_DST$DST "
+    COUNT=$((COUNT + 1))
+    /sbin/ifconfig "$SRC" >/dev/null 2>&1 || fail "Source missing before network initialization: $SRC"
+    if /sbin/ifconfig "$DST" >/dev/null 2>&1; then
+        fail "Target name already in use: $DST"
+    fi
+done < "$MOUNT/interfaces.conf"
+[ "$COUNT" -gt 0 ] || fail "Empty interface mapping"
+
+while IFS='=' read -r SRC DST || [ -n "$SRC$DST" ]; do
+    /sbin/ifconfig "$SRC" name "$DST" || fail "Rename failed: $SRC -> $DST"
+done < "$MOUNT/interfaces.conf"
+echo "SPARE-BOOT: $COUNT network interfaces renamed"
+
+# The request ID makes booting repeatedly with the same ISO idempotent.
+if [ -f "$STORE/last-request" ] && [ "$(cat "$STORE/last-request")" = "$IDENT" ]; then
+    [ "$OLD" = "$MODE" ] || fail "Same request ID but conflicting mode"
+    umount "$MOUNT"
+    echo "SPARE-BOOT: Repeated boot in $MODE, config.xml remains unchanged"
+    exit 0
+fi
+
+if [ "$IMPORT" = 1 ]; then
+    [ "$MODE" = emergency ] || fail "Import allowed only in emergency mode"
+    [ -s "$MOUNT/config.xml" ] || fail "Import file missing"
+    [ "$(sha256 -q "$MOUNT/config.xml")" = "$DIGEST" ] || fail "SHA256 mismatch"
+    # Full XML parse is performed on PVE; guest checks root markers as an extra sanity check.
+    grep -q '<opnsense' "$MOUNT/config.xml" || fail "Not OPNsense XML"
+    grep -q '</opnsense>' "$MOUNT/config.xml" || fail "Incomplete OPNsense XML"
+fi
+
+# Must have destination profile before a non-importing mode switch.
+if [ "$MODE" != "$OLD" ] && [ "$IMPORT" = 0 ]; then
+    [ -s "$STORE/$MODE.xml" ] || fail "Target profile $MODE.xml is missing (first emergency boot requires import)"
+fi
+
+if [ "$MODE" != "$OLD" ] || [ "$IMPORT" = 1 ]; then
+    # Any unexpected power loss leaves the transition marker and blocks the next boot.
+    printf '%s -> %s request %s\n' "$OLD" "$MODE" "$IDENT" > "$STORE/transition"
+    [ -s "$ACTIVE" ] || fail "Active configuration missing"
+    cp "$ACTIVE" "$STORE/$OLD.xml.new" || fail "Could not create snapshot"
+    chmod 600 "$STORE/$OLD.xml.new"
+    mv -f "$STORE/$OLD.xml.new" "$STORE/$OLD.xml"
+
+    if [ "$IMPORT" = 1 ]; then
+        # Preserve an earlier emergency configuration before replacing it.
+        if [ -s "$STORE/emergency.xml" ]; then
+            mkdir -p "$STORE/archive"
+            cp "$STORE/emergency.xml" "$STORE/archive/emergency-before-$IDENT.xml" || fail "Could not archive previous emergency profile"
+            chmod 600 "$STORE/archive/emergency-before-$IDENT.xml"
+        fi
+        cp "$MOUNT/config.xml" "$STORE/emergency.xml.new" || fail "Import copy failed"
+        chmod 600 "$STORE/emergency.xml.new"
+        mv -f "$STORE/emergency.xml.new" "$STORE/emergency.xml"
+    fi
+    [ -s "$STORE/$MODE.xml" ] || fail "Target profile is empty"
+    cp "$STORE/$MODE.xml" "$ACTIVE.new" || fail "Could not copy new configuration"
+    chmod 600 "$ACTIVE.new"
+    mv -f "$ACTIVE.new" "$ACTIVE"
+    printf '%s\n' "$MODE" > "$STORE/active-mode.new"
+    mv -f "$STORE/active-mode.new" "$STORE/active-mode"
+    rm -f "$STORE/transition"
+fi
+
+printf '%s\n' "$IDENT" > "$STORE/last-request.new"
+mv -f "$STORE/last-request.new" "$STORE/last-request"
+umount "$MOUNT"
+MOUNTED=0
+echo "SPARE-BOOT: $OLD -> $MODE (import=$IMPORT), request=$IDENT"
+exit 0

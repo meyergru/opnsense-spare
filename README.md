@@ -45,6 +45,33 @@ Supported interface mapping example:
 
 For a physical firewall with `igc0` (untagged LAN), `igc1` (tagged VLAN trunk), and `igc3` (untagged DHCP WAN), see [`opnsense-spare-three-nic.json.example`](opnsense-spare-three-nic.json.example). The example uses dedicated bridges `vmbrLAN`, `vmbrTRUNK`, and `vmbrWAN`. For a two-interface installation using one VLAN-aware bridge, see [`opnsense-spare.json.example`](opnsense-spare.json.example).
 
+### Preserve the physical interface names *and* MAC addresses
+
+A restored physical OPNsense `config.xml` refers to the original interface names (for example `ix1` and `igc3`), not to Proxmox VirtIO names (`vtnet0`, `vtnet1`). To avoid modifying every imported configuration, V6 performs a **temporary FreeBSD interface rename on every guest boot**, *before* OPNsense configures networking:
+
+```text
+PVE net0 -> FreeBSD vtnet0 -> ifconfig name ix1  -> OPNsense config.xml: ix1
+PVE net1 -> FreeBSD vtnet1 -> ifconfig name igc3 -> OPNsense config.xml: igc3
+```
+
+Define that mapping centrally in `interface_names` in the host JSON; the controller copies it to the attached ISO as `interfaces.conf`. The single guest `import/90-opnsense-spare` hook reads it. There is no separate interface-renaming script. **The renamed device is still a VirtIO device**; this does not emulate the original Intel driver or its hardware capabilities.
+
+MAC addresses are a *separate* setting. In each `networks.emergency.netN` string, set `virtio=<MAC>` to the **actual MAC address of the corresponding physical OPNsense interface** (check `ifconfig` on the physical firewall). This minimizes disruption to DHCP/ISP leases, ARP/neighbor caches and other MAC-sensitive peers. The **maintenance client NIC must instead use a unique, non-production MAC**; the other maintenance NICs are disconnected. Do **not** reuse the illustrative `02:00:00:...` addresses from the examples in a live installation.
+
+| PVE setting | What it means | Where to obtain it |
+|---|---|---|
+| `interface_names.vtnetN` | FreeBSD name expected by the physical `config.xml` | Physical OPNsense `config.xml` / `ifconfig -a` |
+| `networks.emergency.netN: virtio=...` | Production MAC to clone during emergency | Physical OPNsense `ifconfig <interface>` (`ether`) |
+| `networks.maintenance.netN: virtio=...` | Independent maintenance MAC | Generate a unique locally administered MAC |
+| `networks.*.netN: bridge=...` | Layer-2 path of that interface | Your PVE bridges and switch/port layout |
+
+**Before the first V6 boot:** the VM's saved maintenance `config.xml` may still refer to `vtnet0`. Once the hook renames it to the physical name, that old assignment will no longer work. Prepare to reassign the maintenance interface using the **PVE console** to the renamed interface (e.g. `ix1`), configure its independent LAN IP/gateway, and verify it again after reboot. Never depend on SSH alone for this initial transition.
+
+### VLAN transport is optional
+
+In a VLAN-aware PVE bridge, `tag=VID` sets the VM port's **untagged/native** VLAN (PVID); `trunks=VID;VID;...` permits **tagged** VLANs toward the guest. With `tag=4094,trunks=1;10;50`, a deliberately unused VLAN 4094 acts as the native/PVID and VLANs 1, 10 and 50 can arrive at the guest tagged. This is useful when the physical OPNsense expects *even VLAN 1* as a tagged VLAN, but the PVE host's switch uplink uses native/untagged VLAN 1. Check the actual 802.1Q behavior on both directions; UniFi is **not** required. For an untagged LAN or DHCP WAN, an independent `bridge=vmbrLAN` / `bridge=vmbrWAN` with no `tag` or `trunks` is sufficient when the physical connections are separately available.
+
+
 The controller supports contiguous VirtIO slots `net0` through `netN` (up to 32). Both modes define the same slots. Exactly one configured NIC provides maintenance connectivity; all others must have `link_down=1` in maintenance mode. `--link-down` disconnects **every** emergency NIC; `--link-up` restores the configured emergency connectivity.
 
 **Important limitations:** `ifconfig ... name ...` changes an interface's name, not its driver or hardware capabilities. NIC-specific tunables, offloading, IDS/IPS configuration, PCI passthrough, SR-IOV, and provider-specific WAN requirements may need individual adaptation. This implementation expects **VirtIO** NICs presented as `vtnetN` in the guest.
@@ -53,7 +80,7 @@ The controller supports contiguous VirtIO slots `net0` through `netN` (up to 32)
 
 1. Create an OPNsense VM with all required VirtIO NIC slots. Do not enable automatic VM startup. Set up the PVE bridges and physical/VLAN transport paths beforehand.
 2. Install OPNsense and configure it as an ordinary **maintenance LAN client**, using an independent IP and MAC address and a default gateway through the physical firewall. Keep production network services disabled in maintenance mode. Align the maintenance configuration's interface names with `interface_names` in the host JSON.
-3. Install the **single V6 import hook** in the guest and initialize the saved maintenance profile:
+3. Install the **single import hook** in the guest and initialize the saved maintenance profile (keep PVE console access for the initial interface reassignment):
 
    ```sh
    install -m 755 90-opnsense-spare /usr/local/etc/rc.syshook.d/import/90-opnsense-spare
@@ -69,28 +96,10 @@ The controller supports contiguous VirtIO slots `net0` through `netN` (up to 32)
    editor /etc/opnsense-spare.json
    ```
 
-5. Stop the VM, check `opnsense-spare maintenance --dry-run`, then run `opnsense-spare maintenance` and confirm VM startup. Verify the interface renaming, management connectivity, DNS, gateway, WebGUI, and SSH. Reboot once more to verify idempotence.
+5. Stop the VM, check `opnsense-spare maintenance --dry-run`, then run `opnsense-spare maintenance` and confirm VM startup. **At the PVE console**, correct any old `vtnetN` maintenance interface assignment to the configured physical name; then verify management IP, gateway, WebGUI, and SSH. Reboot once more to verify idempotence.
 6. Test emergency mode **with `--link-down` first**. Do not connect production MAC/IP addresses to the network while the physical firewall is online. Test the complete failback and export paths before using the spare in production.
 
 **Boot dependency:** The hook intentionally fails closed if its valid mode ISO is missing or the mapping is invalid. Keep Proxmox console access and a VM backup available.
-
-## Migrating from V5
-
-1. Back up the VM, existing PVE controller/JSON/state file, guest hooks, and `/conf/spare/` profiles. Ensure the VM is stopped in its confirmed maintenance mode.
-2. Convert the V5 host JSON **without overwriting the original**:
-
-   ```sh
-   python3 migrate-v5-config.py /etc/opnsense-spare.json \
-     --name vtnet0=ix1 --name vtnet1=igc3 \
-     -o /etc/opnsense-spare-v6.json
-   ```
-
-3. Review the new JSON: `interface_names`, `maintenance_client_nic`, every NIC profile, MAC addresses, bridges, VLANs, SSH options, and the transfer path. Ensure target FreeBSD interface names match the guest's saved maintenance configuration. Back up the old JSON before installing the new one.
-4. Install the V6 guest import hook. **Disable/remove the old** `/usr/local/etc/rc.syshook.d/early/10-spare-interface-names`; otherwise both hooks will attempt renaming.
-5. Install the V6 host controller. With the VM stopped, invoke `opnsense-spare maintenance` to generate a **V6 ISO with `interfaces.conf`**. An older V5 ISO will not satisfy the new hook.
-6. Boot in **maintenance only** and verify NIC names and connectivity, including after a second boot. Only then try an isolated emergency import.
-
-If the prior state is `prepared` or `incomplete`, do not migrate blindly. Reconcile the state with the actual last guest mode first. A manually started VM can invalidate the host's assumed state.
 
 ## Operation
 
@@ -143,7 +152,6 @@ The automated tests exercise controller state transitions, imports/exports, ISO 
 | `90-opnsense-spare` | Single OPNsense guest import hook (FreeBSD `/bin/sh`) |
 | `opnsense-spare.json.example` | Example two-NIC configuration |
 | `opnsense-spare-three-nic.json.example` | Example three-NIC topology |
-| `migrate-v5-config.py` | Migration helper for V5 JSON |
 | `test_host.py`, `test_v6.py` | Unit and regression tests |
 | `CHANGELOG-V5.md`, `CHANGELOG-V6.md` | Development history |
 
