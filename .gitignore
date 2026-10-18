@@ -1,0 +1,19 @@
+# Runtime state and real firewall configurations must never be committed.
+config.xml
+**/config.xml
+state.json
+**/state.json
+*.iso
+*.qcow2
+*.raw
+*.bak
+*.key
+id_rsa*
+id_ed25519*
+*.pem
+*.p12
+*.pfx
+*.log
+__pycache__/
+*.py[cod]
+.venv/
