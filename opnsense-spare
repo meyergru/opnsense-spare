@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""Proxmox controller for a universal OPNsense cold spare (V6).
+
+No background daemon; requires a stopped VM for every mode change.
+See README.md before using on a production host.
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+
+REQUIRED = (
+    "vmid", "iso_dir", "iso_storage", "state_file", "networks",
+    "interface_names", "maintenance_client_nic",
+    "maintenance_ssh_host", "maintenance_ssh_user",
+)
+
+
+def die(message):
+    raise RuntimeError(message)
+
+
+def run(*argv, capture=False, timeout=30):
+    p = subprocess.run(list(map(str, argv)), check=True,
+                       stdout=subprocess.PIPE if capture else None,
+                       stderr=subprocess.PIPE if capture else None,
+                       timeout=timeout)
+    return p.stdout if capture else b""
+
+
+def atomic_bytes(path, content, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".spare-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as fp:
+            os.fchmod(fp.fileno(), mode)
+            fp.write(content)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def load_state(path):
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def save_state(path, state):
+    atomic_bytes(path, (json.dumps(state, indent=2, sort_keys=True) + "\n").encode())
+
+
+def validate_xml(raw, label):
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as e:
+        die(f"{label}: invalid XML: {e}")
+    if root.tag != "opnsense":
+        die(f"{label}: root element is {root.tag!r}, expected 'opnsense'")
+    return raw
+
+
+def require_file(path):
+    if not path.is_file() or path.is_symlink():
+        die(f"File is missing or is a symbolic link: {path}")
+    return path
+
+
+def ask(prompt, default=False):
+    """Accepts a simple yes/no answer."""
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        response = input(f"{prompt} {suffix} ").strip().lower()
+        if not response:
+            return default
+        if response in ("j", "ja", "y", "yes"):
+            return True
+        if response in ("n", "nein", "no"):
+            return False
+        print("Please enter y or n (Enter uses the default).")
+
+
+def exact_confirm(cfg=None):
+    # A single affirmative response is sufficient.
+    print("\nEMERGENCY MODE:", (cfg or {}).get("emergency_instructions",
+          "The physical OPNsense must be powered off and the external WAN cable moved to the spare."))
+    if not ask("Are these requirements satisfied?", False):
+        die("Not confirmed; no changes made.")
+
+
+def parse_net_profile(key, value):
+    """Validate critical NIC/VLAN parameters before calling qm set.
+
+    PVE accepts semicolon-separated VLAN IDs and ranges.
+    Other optional qemu-net parameters are validated by qm set.
+    """
+    if not isinstance(value, str):
+        die(f"{key}: Network profile must be a string")
+    pieces = value.split(",")
+    first = pieces.pop(0)
+    if not re.fullmatch(r"virtio=([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", first):
+        die(f"{key}: virtio requires a valid MAC address")
+    params = {"virtio": first.split("=", 1)[1].lower()}
+    for piece in pieces:
+        if "=" not in piece:
+            die(f"{key}: Parameter missing '=': {piece!r}")
+        name, val = piece.split("=", 1)
+        if not name or not val or name in params:
+            die(f"{key}: empty or duplicate parameter: {name!r}")
+        params[name] = val
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", params.get("bridge", "")):
+        die(f"{key}: missing valid bridge=... parameter")
+    if "tag" in params:
+        if not re.fullmatch(r"[0-9]+", params["tag"]) or not 1 <= int(params["tag"]) <= 4094:
+            die(f"{key}: invalid VLAN ID in tag={params['tag']!r} (1–4094)")
+    if "trunks" in params:
+        value = params["trunks"]
+        if not re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:;[0-9]+(?:-[0-9]+)?)*", value):
+            die(f"{key}: invalid trunks list {value!r}; expected e.g. '1;7;10;50-56'")
+        for item in value.split(";"):
+            a, _, b = item.partition("-")
+            low, high = int(a), int(b) if b else int(a)
+            if not 1 <= low <= high <= 4094:
+                die(f"{key}: invalid VLAN range {item!r} in trunks (1–4094)")
+    for name in ("link_down", "firewall"):
+        if name in params and params[name] not in ("0", "1"):
+            die(f"{key}: {name} must be 0 or 1")
+    return params
+
+
+def nic_keys(cfg):
+    # The VM must keep its virtio slots stable for FreeBSD vtnet numbering.
+    return sorted(cfg["networks"]["maintenance"], key=lambda k: int(k[3:]))
+
+
+def ifmap_bytes(cfg):
+    # A read-only ISO file, never evaluated as shell code in the guest.
+    return ("".join(f"{src}={dst}\n" for src, dst in
+                    sorted(cfg["interface_names"].items(),
+                           key=lambda p: int(p[0][5:])))).encode("ascii")
+
+
+def validate_config(cfg):
+    for field in REQUIRED:
+        if field not in cfg or cfg[field] in (None, "", {}):
+            die(f"Missing configuration parameter: {field}")
+    try:
+        vmid = int(cfg["vmid"])
+    except (ValueError, TypeError):
+        die("Invalid VM ID")
+    if not 100 <= vmid <= 999999999:
+        die("Invalid VM ID")
+    if not isinstance(cfg["iso_storage"], str) or not re.fullmatch(r"[A-Za-z0-9_-]+", cfg["iso_storage"]):
+        die("Invalid PVE storage identifier")
+    if cfg["maintenance_ssh_host"] in ("CHANGE_ME", "192.0.2.10"):
+        die("maintenance_ssh_host must be configured in JSON")
+    if cfg.get("ssh_identity") is not None and not isinstance(cfg["ssh_identity"], str):
+        die("ssh_identity must be a path, null, or omitted")
+    nets = cfg["networks"]
+    if not isinstance(nets, dict) or set(nets) != {"maintenance", "emergency"}:
+        die("networks must contain maintenance and emergency")
+    if not all(isinstance(nets[x], dict) for x in nets):
+        die("networks.* must be an object of netN entries")
+    keys = set(nets["maintenance"])
+    if keys != set(nets["emergency"]) or not keys:
+        die("Both modes must define the same netN slots")
+    if not all(re.fullmatch(r"net(0|[1-9][0-9]*)", k) for k in keys):
+        die("Allowed keys: net0, net1, ...")
+    if keys != {f"net{i}" for i in range(len(keys))} or len(keys) > 32:
+        die("NIC slots must start at net0, be contiguous, and number at most 32")
+    names = cfg["interface_names"]
+    if not isinstance(names, dict) or set(names) != {f"vtnet{i}" for i in range(len(keys))}:
+        die("interface_names must assign exactly one target name to each vtnetN")
+    if len(set(names.values())) != len(keys):
+        die("Interface target names must be unique")
+    for src, dst in names.items():
+        if not isinstance(dst, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,14}", dst):
+            die(f"Invalid FreeBSD interface name: {src} -> {dst!r}")
+        if dst.startswith("vtnet") or dst.startswith("lo"):
+            die(f"Target interface name is reserved for this mapping: {dst}")
+    # Ensure contents are entirely ASCII and digestable before any qm action.
+    ifmap_bytes(cfg)
+    if cfg["maintenance_client_nic"] not in keys:
+        die("maintenance_client_nic must refer to a configured netN slot")
+    parsed = {}
+    for mode in ("maintenance", "emergency"):
+        parsed[mode] = {}
+        for key in nic_keys(cfg):
+            value = nets[mode][key]
+            if not isinstance(value, str) or "CHANGE_ME" in value or "XX:" in value:
+                die(f"{mode}.{key} contains a placeholder")
+            parsed[mode][key] = parse_net_profile(f"{mode}.{key}", value)
+    client = cfg["maintenance_client_nic"]
+    if parsed["maintenance"][client].get("link_down") == "1":
+        die("Maintenance client NIC must not have link_down=1")
+    if "trunks" in parsed["maintenance"][client]:
+        die("Maintenance client NIC must not have a VLAN trunk")
+    for key in keys - {client}:
+        if parsed["maintenance"][key].get("link_down") != "1":
+            die(f"{key} must have link_down=1 in maintenance mode")
+    emer_macs = [parsed["emergency"][key]["virtio"] for key in nic_keys(cfg)]
+    if len(set(emer_macs)) != len(emer_macs):
+        die("Emergency interfaces have duplicate MAC addresses")
+    if parsed["maintenance"][client]["virtio"] in emer_macs:
+        die("Active maintenance MAC must not match an emergency MAC")
+    if cfg["state_file"] == cfg.get("transfer_default"):
+        die("state_file and transfer_default must not be identical")
+    if not Path(cfg["iso_dir"]).is_dir():
+        die("iso_dir does not exist; check PVE ISO directory")
+
+def vm_status(vmid):
+    raw = run("qm", "status", vmid, capture=True).decode(errors="replace")
+    m = re.search(r"^status:\s*(\w+)", raw, flags=re.M)
+    if not m:
+        die(f"Unexpected qm status output: {raw}")
+    return m.group(1)
+
+
+def vm_config(vmid):
+    return run("qm", "config", vmid, capture=True).decode(errors="replace")
+
+
+def iso_name(cfg, mode):
+    # Names stay stable. Only request_id *inside* the ISO is regenerated.
+    return f"opnsense-spare-{cfg['vmid']}-{mode}.iso"
+
+
+def iso_digest(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def make_iso(cfg, mode, import_path):
+    """Atomically replace a per-mode ISO, only while the VM is stopped."""
+    ident = uuid.uuid4().hex  # Guest needs a fresh request_id, not a unique filename.
+    name = iso_name(cfg, mode)
+    dest = Path(cfg["iso_dir"]) / name
+    # Build in a private staging directory ON THE SAME FILESYSTEM as ISO storage.
+    # This avoids exposing the unencrypted config.xml and permits atomic rename.
+    stage = Path(tempfile.mkdtemp(prefix=".opnsense-spare-build-", dir=cfg["iso_dir"]))
+    try:
+        source_dir = stage / "source"
+        source_dir.mkdir(mode=0o700)
+        mapping = ifmap_bytes(cfg)
+        (source_dir / "interfaces.conf").write_bytes(mapping)
+        lines = ["magic=OPNSENSE_SPARE_V1", f"mode={mode}", f"request_id={ident}",
+                 f"ifmap_sha256={hashlib.sha256(mapping).hexdigest()}"]
+        if import_path is not None:
+            raw = validate_xml(require_file(import_path).read_bytes(), str(import_path))
+            (source_dir / "config.xml").write_bytes(raw)
+            (source_dir / "config.xml").chmod(0o600)
+            lines += ["import=1", f"sha256={hashlib.sha256(raw).hexdigest()}"]
+        else:
+            lines += ["import=0", "sha256=none"]
+        (source_dir / "request.conf").write_text("\n".join(lines) + "\n")
+        candidate = stage / "new.iso"
+        run("xorriso", "-as", "mkisofs", "-quiet", "-V", "OSPARE", "-o", candidate, source_dir, timeout=90)
+        os.chmod(candidate, 0o600)
+        os.replace(candidate, dest)
+        return ident, name, dest
+    finally:
+        shutil.rmtree(stage)
+
+
+def set_link_down(profile, down):
+    """Set the Emergency link status explicitly on each NIC, overriding any stale JSON value."""
+    parts = [x for x in profile.split(",") if not x.startswith("link_down=")]
+    parts.append("link_down=1" if down else "link_down=0")
+    result = ",".join(parts)
+    parse_net_profile("emergency link", result)
+    return result
+
+
+def vm_net_and_iso(actual):
+    """Read all VM network slots and ISO attachment."""
+    profiles = dict(re.findall(r"^(net[0-9]+):\s*(.+)$", actual, flags=re.M))
+    match = re.search(r"^ide2:\s*([^,]+)", actual, flags=re.M)
+    profiles["iso_volume"] = match.group(1) if match else None
+    return profiles
+
+
+def prepared_matches(cfg, actual, prepared):
+    current = vm_net_and_iso(actual)
+    keys = nic_keys(cfg)
+    if {k for k in current if k != "iso_volume"} != set(keys):
+        die("Prepared state has changed: NIC inventory does not match")
+    for key in keys:
+        if parse_net_profile(key, current[key]) != parse_net_profile(key, prepared["networks"][key]):
+            die(f"Prepared state has changed: {key}; leave VM stopped and inspect manually")
+    iso = prepared["iso"]
+    expected = f"{cfg['iso_storage']}:iso/{iso}"
+    if current["iso_volume"] != expected:
+        die("Prepared state has changed: ISO attachment")
+    path = Path(cfg["iso_dir"]) / iso
+    if not path.is_file() or iso_digest(path) != prepared["sha256"]:
+        die("Prepared state has changed: ISO contents")
+
+
+def legacy_target_profile(cfg, mode, current):
+    """Guarded recovery for a V5 staging failure (only if every NIC matches)."""
+    keys = nic_keys(cfg)
+    if {k for k in current if k != "iso_volume"} != set(keys):
+        return False
+    for key in keys:
+        existing = parse_net_profile(key, current[key])
+        base = cfg["networks"][mode][key]
+        choices = ([set_link_down(base, False), set_link_down(base, True)]
+                   if mode == "emergency" else [base])
+        if not any(existing == parse_net_profile(key, choice) for choice in choices):
+            return False
+    return True
+
+
+def qemu_net(cfg, nets):
+    vmid = str(cfg["vmid"])
+    for key in nic_keys(cfg):
+        run("qm", "set", vmid, f"--{key}", nets[key])
+    run("qm", "set", vmid, "--onboot", "0")
+
+def maintenance_export(cfg, dest):
+    remote = f"{cfg['maintenance_ssh_user']}@{cfg['maintenance_ssh_host']}"
+    argv = ["ssh", "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=5"]
+    # Explicit key file stays supported; otherwise defer entirely to OpenSSH,
+    # including SSH_AUTH_SOCK and a forwarded ssh-agent. No private key on PVE required.
+    identity = cfg.get("ssh_identity")
+    if identity:
+        require_file(Path(identity))
+        argv += ["-i", identity]
+    argv += [remote, "cat /conf/spare/emergency.xml"]
+    deadline = time.monotonic() + int(cfg.get("ssh_timeout_seconds", 90))
+    err = ""
+    while time.monotonic() < deadline:
+        try:
+            p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=12, check=False)
+            if p.returncode == 0:
+                raw = validate_xml(p.stdout, "Export from guest VM")
+                dest = Path(dest)
+                if dest.is_symlink() or not dest.parent.is_dir():
+                    die("Export destination must not be a symbolic link and its parent directory must exist")
+                if dest.exists():
+                    if not ask(f"{dest} exists. Archive and replace the old file?", False):
+                        die("Export cancelled; guest copy remains in /conf/spare/emergency.xml")
+                    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    backup = dest.with_name(dest.name + f".{stamp}.bak")
+                    if backup.exists():
+                        die("Archive file already exists")
+                    os.replace(dest, backup)
+                    os.chmod(backup, 0o600)
+                    print(f"Previous transfer file archived: {backup}")
+                atomic_bytes(dest, raw)
+                print(f"Emergency configuration exported: {dest} (SHA256 {hashlib.sha256(raw).hexdigest()})")
+                return
+            err = p.stderr.decode(errors="replace").strip()[-300:]
+        except subprocess.TimeoutExpired:
+            err = "SSH timeout"
+        time.sleep(2)
+    die("Export unavailable. With maintenance running, retry using "
+        f"'opnsense-spare maintenance --transfer {dest}' to retry the export. SSH: {err}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="OPNsense cold-spare mode switch (run on PVE host only)")
+    ap.add_argument("mode", choices=["maintenance", "emergency"])
+    ap.add_argument("--config", default="/etc/opnsense-spare.json")
+    ap.add_argument("--transfer", help="Path for import (emergency) or export (maintenance)")
+    ap.add_argument("--dry-run", action="store_true", help="Preview actions without making changes")
+    link = ap.add_mutually_exclusive_group()
+    link.add_argument("--link-down", action="store_true", help="Emergency: disconnect all guest NICs for isolated testing")
+    link.add_argument("--link-up", action="store_true", help="Emergency: connect all guest NICs")
+    ap.add_argument("--recover-incomplete", action="store_true",
+                    help="Recover a V4 declined-boot state as prepared; other failures require inspection")
+    args = ap.parse_args()
+    if os.geteuid() != 0:
+        die("Must run as root on the PVE host")
+    if args.mode != "emergency" and (args.link_down or args.link_up):
+        die("--link-down/--link-up are valid only in emergency mode")
+    cfg = json.loads(Path(args.config).read_text())
+    validate_config(cfg)
+    vmid = str(cfg["vmid"])
+    state_path = Path(cfg["state_file"])
+    lock_path = state_path.with_name("opnsense-spare.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        state = load_state(state_path)
+        if state is None:
+            if args.dry_run:
+                print("No saved state; assuming initial maintenance mode")
+                state = {"mode": "maintenance", "pending_export": False}
+            else:
+                print("Initial setup: guest hook and maintenance configuration must be ready.")
+                if not ask("Guest hook installed and maintenance profile initialized?", True):
+                    die("Cancelled")
+                state = {"mode": "maintenance", "pending_export": False}
+                save_state(state_path, state)
+        previous = state["mode"]
+        if args.recover_incomplete:
+            if args.dry_run:
+                die("--recover-incomplete cannot be combined with --dry-run")
+            if not state.get("incomplete"):
+                print("No incomplete marker exists; nothing to recover.")
+                return
+            if vm_status(vmid) != "stopped":
+                die("Recovery is allowed only when the VM is stopped")
+            actual = vm_config(vmid)
+            current = vm_net_and_iso(actual)
+            target = state["incomplete"].get("target")
+            # V4 bug: explicitly declining a boot leaves incomplete after
+            # successful qm set --net0, --net1 and --ide2.
+            if target in ("maintenance", "emergency") and legacy_target_profile(cfg, target, current):
+                iso = iso_name(cfg, target)
+                path = Path(cfg["iso_dir"]) / iso
+                if current["iso_volume"] == f"{cfg['iso_storage']}:iso/{iso}" and path.is_file():
+                    print(f"V4-Recovery: complete {target} profile is configured; VM is stopped.")
+                    print("The ISO will be regenerated on the next run; the VM will not start automatically.")
+                    if not ask("Accept prepared state and clear the incomplete marker?", False):
+                        die("Recovery aborted")
+                    state["prepared"] = {"mode": target, "networks": {key: current[key] for key in nic_keys(cfg)}, "iso": iso,
+                                         "sha256": iso_digest(path), "legacy_recovered": True}
+                    state.pop("incomplete", None)
+                    save_state(state_path, state)
+                    print("Recovered as prepared, not started. Run the normal command again.")
+                    return
+            # Recovery of a genuinely failed operation only if the previous
+            # complete, known configuration (and media digest) is untouched.
+            wanted = {key: state.get("last_networks", {}).get(key,
+                    state.get(f"last_{key}", cfg["networks"][previous][key]))
+                    for key in nic_keys(cfg)}
+            for key in nic_keys(cfg):
+                if parse_net_profile(f"{key} (Ist)", current[key]) != parse_net_profile(f"{key} (Soll)", wanted[key]):
+                    die(f"Recovery aborted: {key} does not match the last mode {previous}")
+            request_id = state.get("last_request")
+            if not request_id:
+                die("Recovery aborted: last confirmed request ID is missing")
+            wanted_iso = state.get("last_iso", f"opnsense-spare-{vmid}-{request_id}.iso")
+            if current["iso_volume"] != f"{cfg['iso_storage']}:iso/{wanted_iso}":
+                die("Recovery aborted: CD-ROM does not match the last confirmed ISO")
+            digest = state.get("last_iso_sha256")
+            if digest:
+                current_iso = Path(cfg["iso_dir"]) / wanted_iso
+                if not current_iso.is_file() or iso_digest(current_iso) != digest:
+                    die("Recovery aborted: previous ISO has changed; manual inspection required")
+            if not ask("VM unchanged in last mode; clear incomplete marker?", False):
+                die("Recovery aborted")
+            state.pop("incomplete", None)
+            save_state(state_path, state)
+            print("Incomplete marker cleared; command can be retried.")
+            return
+        status = vm_status(vmid)
+        if state.get("incomplete"):
+            die("Previous transition incomplete; use --recover-incomplete only after inspection")
+        if state.get("prepared"):
+            # V5 stored net0/net1 at the top level; accept only a matching
+            # two-interface V6 configuration, then verify actual VM hardware.
+            if "networks" not in state["prepared"]:
+                if set(nic_keys(cfg)) != {"net0", "net1"}:
+                    die("Old prepared state has different NIC count; manual inspection required")
+                state["prepared"]["networks"] = {
+                    key: state["prepared"][key] for key in nic_keys(cfg)}
+            if status != "stopped":
+                die("Prepared VM is running; it may have been started manually. "
+                    "Check guest mode before manually reconciling host state.")
+            prepared_matches(cfg, vm_config(vmid), state["prepared"])
+            print("Note: VM start was declined; profile is prepared only.")
+            print("To switch again, the VM must NOT have been manually started since then.")
+            if not args.dry_run and not ask("Confirm that the VM has not been started since then?", False):
+                die("Cancelled. First verify guest mode and host state.")
+        if state.get("pending_export") and args.mode != "maintenance":
+            print("WARNING: Export of the last emergency configuration is still pending.")
+            print("The guest copy /conf/spare/emergency.xml remains available, "
+                  "but can be overwritten by subsequent emergency operation.")
+            if args.dry_run:
+                print("DRY RUN: confirmation to skip pending export would be required")
+            else:
+                if not ask("Skip the pending export to the host?", False):
+                    die("Export first using maintenance --transfer ...")
+                state["pending_export"] = False
+                save_state(state_path, state)
+        transfer = Path(args.transfer or cfg.get("transfer_default", "")) if (args.transfer or cfg.get("transfer_default")) else None
+        print(f"VM {vmid}: {status}; Host mode: {previous}; Target: {args.mode}")
+
+        # Retry only previously pending export in running maintenance guest.
+        if args.mode == "maintenance" and status == "running" and previous == "maintenance" and state.get("pending_export"):
+            if not transfer:
+                die("Missing --transfer path for export retry")
+            if args.dry_run:
+                print(f"DRY RUN: Retry export to {transfer}")
+                return
+            maintenance_export(cfg, transfer)
+            state["pending_export"] = False
+            save_state(state_path, state)
+            return
+        if status != "stopped":
+            die("VM must be stopped; automatic shutdown is not supported")
+        exporting = False
+        importing = False
+        emergency_link_down = False
+        if args.mode == "emergency":
+            if previous == "emergency":
+                print("WARNING: Previous mode is already emergency. A new import will overwrite guest changes!")
+            if args.link_down:
+                emergency_link_down = True
+            elif args.link_up:
+                emergency_link_down = False
+            elif args.dry_run:
+                # Dry-run is noninteractive; without a switch show the safer option.
+                emergency_link_down = True
+                print("DRY RUN: Without --link-up/--link-down the link state will be prompted interactively")
+            else:
+                emergency_link_down = ask("Disable all emergency NICs for isolated testing?", False)
+            if not emergency_link_down and not args.dry_run:
+                exact_confirm(cfg)
+            if emergency_link_down:
+                print("Emergency NICs: ALL DISCONNECTED (test; physical OPNsense may remain online)")
+            importing = ask("Import the current physical OPNsense config.xml?", previous != "emergency") if not args.dry_run else bool(transfer)
+            if importing:
+                if not transfer:
+                    die("For import specify --transfer PATH or transfer_default in JSON")
+                validate_xml(require_file(transfer).read_bytes(), str(transfer))
+        elif previous == "emergency":
+            exporting = ask("Export emergency config.xml to the PVE host after switching?", True) if not args.dry_run else bool(transfer)
+            if exporting and not transfer:
+                die("For export specify --transfer PATH or transfer_default in JSON")
+        elif state.get("pending_export"):
+            exporting = True
+            if not transfer:
+                die("Pending export requires --transfer PATH")
+
+        nets = dict(cfg["networks"][args.mode])
+        if args.mode == "emergency":
+            nets = {k: set_link_down(value, emergency_link_down) for k, value in nets.items()}
+        for key in nic_keys(cfg):
+            print(f"{key}: {nets[key]}")
+        print(f"Configuration import: {transfer if importing else 'NO'}")
+        print(f"Configuration export: {transfer if exporting else 'NO'}")
+        if args.dry_run:
+            return
+
+        prev_vm = vm_config(vmid)
+        existing_nets = vm_net_and_iso(prev_vm)
+        if {k for k in existing_nets if k != "iso_volume"} != set(nic_keys(cfg)):
+            die("VM NIC inventory differs from JSON. Create net0..netN in PVE first; "
+                "additional NICs must also appear in JSON")
+        if not shutil.which("xorriso"):
+            die("xorriso is missing: apt install xorriso")
+
+        # Record intent before changing hardware, prevents unreviewed retry on partial failure.
+        state["incomplete"] = {"target": args.mode, "time": datetime.now(timezone.utc).isoformat()}
+        save_state(state_path, state)
+        iso = None
+        try:
+            ident, name, iso = make_iso(cfg, args.mode, transfer if importing else None)
+            qemu_net(cfg, nets)
+            run("qm", "set", vmid, "--ide2", f"{cfg['iso_storage']}:iso/{name},media=cdrom")
+            # do not delete previous ISO automatically: it may be recovery evidence
+            prepared = {"mode": args.mode, "networks": nets,
+                        "iso": name, "sha256": iso_digest(iso),
+                        "request_id": ident}
+            if not ask("Start VM with this profile now?", True):
+                state["prepared"] = prepared
+                state.pop("incomplete", None)
+                save_state(state_path, state)
+                print("VM remains OFF. Profile prepared (not an error state).")
+                print("You may call opnsense-spare again to reconfigure it; "
+                      "do not run qm start manually without reconciling state.")
+                return
+            run("qm", "start", vmid, timeout=90)
+            state["mode"] = args.mode
+            state["last_request"] = ident
+            state["last_iso"] = name
+            state["last_iso_sha256"] = iso_digest(iso)
+            state["last_networks"] = nets
+            state["pending_export"] = exporting
+            state.pop("incomplete", None)
+            state.pop("prepared", None)
+            save_state(state_path, state)
+            print(f"VM start requested (ISO {name}). Check guest configuration in the console.")
+        except Exception:
+            print("ERROR: State marked incomplete; no automatic retry.", file=sys.stderr)
+            raise
+
+        if exporting:
+            try:
+                maintenance_export(cfg, transfer)
+            except Exception:
+                print("Guest export copy preserved, but transfer failed. ",
+                      "Retry 'maintenance --transfer ...' while the VM is running.", file=sys.stderr)
+                raise
+            state["pending_export"] = False
+            save_state(state_path, state)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, OSError, ValueError, KeyboardInterrupt) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
