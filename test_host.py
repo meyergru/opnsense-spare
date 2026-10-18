@@ -35,6 +35,8 @@ class Harness:
 
     def run(self, *cmd, **kw):
         self.commands.append(cmd)
+        if cmd[:2] == ('pvesm', 'path'):
+            return str(self.root / cmd[2].split('/')[-1]).encode()
         if cmd[:2] == ('qm', 'status'):
             return f'status: {self.status}\n'.encode()
         if cmd[:2] == ('qm', 'config'):
@@ -91,6 +93,47 @@ class StatelessControllerTests(unittest.TestCase):
         for s in (valid.replace('50-56','i53'),valid.replace('666','4095'),
                   valid.replace('50-56','56-50'),valid.replace('1;4','1;;4')):
             with self.assertRaises(RuntimeError):spare.parse_net_profile('net0',s)
+
+    def test_optional_ssh_ports_validate_without_changing_defaults(self):
+        with tempfile.TemporaryDirectory() as td:
+            h = Harness(self, Path(td))
+            spare.validate_config(h.cfg)
+            for name in ("maintenance_ssh_port", "emergency_ssh_port"):
+                for value in (1, 22, 3000, 65535, None):
+                    cfg = dict(h.cfg, **{name: value})
+                    spare.validate_config(cfg)
+                for value in (0, 65536, -1, "22", 22.0, True, False, [], {}):
+                    cfg = dict(h.cfg, **{name: value})
+                    with self.subTest(parameter=name, invalid=value):
+                        with self.assertRaisesRegex(RuntimeError, name):
+                            spare.validate_config(cfg)
+
+    def test_export_ssh_port_overrides_client_config_when_set(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            h = Harness(self, root)
+            destination = root / "export.xml"
+            xml = b"<opnsense><test/></opnsense>"
+            commands = []
+            def fake_ssh(argv, **kwargs):
+                commands.append(list(argv))
+                p = MagicMock()
+                p.returncode = 0
+                p.stdout = xml
+                return p
+            with patch.object(spare.subprocess, "run", side_effect=fake_ssh):
+                spare.maintenance_export(h.cfg, destination)
+            self.assertNotIn("-p", commands[0])
+            self.assertEqual(destination.read_bytes(), xml)
+            destination.unlink()
+            h.cfg["maintenance_ssh_port"] = 22
+            h.cfg["emergency_ssh_port"] = 3000
+            commands.clear()
+            with patch.object(spare.subprocess, "run", side_effect=fake_ssh):
+                spare.maintenance_export(h.cfg, destination)
+            self.assertIn(["-p", "22"], [commands[0][i:i+2] for i in range(len(commands[0])-1)])
+            self.assertNotIn("3000", commands[0])
+            self.assertEqual(destination.read_bytes(), xml)
 
     def test_iso_contains_checksums_and_new_ids(self):
         with tempfile.TemporaryDirectory() as td:
@@ -188,6 +231,97 @@ class StatelessControllerTests(unittest.TestCase):
             with patch.object(h,'run',side_effect=ignored_iso):
                 h.invoke('emergency',['--link-down'],error='did not attach')
             self.assertEqual(h.count(('qm','start')),0)
+
+    def test_ssh_authentication_errors_abort_without_retry(self):
+        errors = (
+            "root@192.168.10.99: Permission denied (publickey).",
+            "Received disconnect: Too many authentication failures",
+            "Authentication failed.",
+            "Host key verification failed.",
+            "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Harness(self, root).cfg
+            cfg["ssh_timeout_seconds"] = 90
+            for error in errors:
+                with self.subTest(error=error):
+                    dest = root / "failure.xml"
+                    response = MagicMock(returncode=255, stdout=b"",
+                                         stderr=error.encode())
+                    with patch.object(spare.subprocess, "run", return_value=response) as ssh, \
+                         patch.object(spare.time, "sleep") as sleep:
+                        with self.assertRaisesRegex(RuntimeError, "Not retrying"):
+                            spare.maintenance_export(cfg, dest)
+                        ssh.assert_called_once()
+                        sleep.assert_not_called()
+                    self.assertFalse(dest.exists())
+
+    def test_ssh_transient_failure_retries_and_export_succeeds(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Harness(self, root).cfg
+            dest = root / "recovered.xml"
+            failure = MagicMock(returncode=255, stdout=b"",
+                                stderr=b"ssh: connect to host 192.168.10.99 port 22: Connection refused")
+            success = MagicMock(returncode=0, stdout=EXAMPLE, stderr=b"")
+            with patch.object(spare.subprocess, "run", side_effect=[failure, success]) as ssh, \
+                 patch.object(spare.time, "sleep") as sleep:
+                spare.maintenance_export(cfg, dest)
+            self.assertEqual(ssh.call_count, 2)
+            sleep.assert_called_once_with(2)
+            self.assertEqual(dest.read_bytes(), EXAMPLE)
+
+    def test_remote_command_errors_not_misclassified_as_auth(self):
+        self.assertFalse(spare.ssh_nonretryable_error(1, "Permission denied (publickey)."))
+        self.assertFalse(spare.ssh_nonretryable_error(255, "Connection timed out"))
+        self.assertFalse(spare.ssh_nonretryable_error(255, "Connection refused"))
+
+    def test_export_rejects_directory_without_ssh_or_vm_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            h = Harness(self, Path(td))
+            with self.assertRaisesRegex(RuntimeError, "regular file"):
+                spare.validate_export_destination(Path(td))
+            with patch.object(spare.subprocess, 'run') as ssh:
+                with self.assertRaisesRegex(RuntimeError, "regular file"):
+                    spare.maintenance_export(h.cfg, Path(td))
+                ssh.assert_not_called()
+            h.invoke('maintenance', ['--transfer', td], error='regular file')
+            self.assertEqual(h.count(('qm', 'set')), 0)
+
+    def test_iso_storage_resolves_to_generated_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = {'iso_dir': td, 'iso_storage': 'local'}
+            iso = 'opnsense-spare-999-maintenance.iso'
+            with patch.object(spare, 'run', return_value=(td+'/'+iso+'\n').encode()):
+                self.assertEqual(spare.verify_iso_storage(cfg, iso), 'local:iso/'+iso)
+            with patch.object(spare, 'run', return_value=b'/wrong/location.iso\n'):
+                with self.assertRaisesRegex(RuntimeError, 'ISO storage mismatch'):
+                    spare.verify_iso_storage(cfg, iso)
+
+    def test_non_cdrom_ide2_rejected(self):
+        spare.verify_optical_slot('ide2: local:iso/test.iso,media=cdrom\n')
+        spare.verify_optical_slot('net0: virtio=02:00:00:00:00:01\n')
+        with self.assertRaisesRegex(RuntimeError, 'non-CD-ROM'):
+            spare.verify_optical_slot('ide2: local-lvm:vm-999-disk-0,size=8G\n')
+
+    def test_export_replacement_preserves_old_file_during_staging_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            dest = root / 'out.xml'
+            dest.write_bytes(EXAMPLE)
+            bad = b'<?xml version="1.0"?><opnsense><other/></opnsense>'
+            cfg = Harness(self, root).cfg
+            def fake_ssh(*args, **kwargs):
+                p = MagicMock()
+                p.returncode = 0
+                p.stdout = bad
+                return p
+            with patch.object(spare.subprocess, 'run', side_effect=fake_ssh), \
+                 patch.object(spare.os, 'fdopen', side_effect=OSError('disk full')):
+                with self.assertRaisesRegex(OSError, 'disk full'):
+                    spare.maintenance_export(cfg, dest)
+            self.assertEqual(dest.read_bytes(), EXAMPLE)
 
     def test_export_without_transfer_is_never_automatic(self):
         with tempfile.TemporaryDirectory() as td:

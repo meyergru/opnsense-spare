@@ -161,6 +161,12 @@ def validate_config(cfg):
         die("maintenance_ssh_host must be configured in JSON")
     if cfg.get("ssh_identity") is not None and not isinstance(cfg["ssh_identity"], str):
         die("ssh_identity must be a path, null, or omitted")
+    # Optional mode-specific SSH ports. No explicit port means OpenSSH uses
+    # its existing client configuration (including ~/.ssh/config).
+    for name in ("maintenance_ssh_port", "emergency_ssh_port"):
+        port = cfg.get(name)
+        if port is not None and (type(port) is not int or not 1 <= port <= 65535):
+            die(f"{name} must be an integer between 1 and 65535, null, or omitted")
     nets = cfg["networks"]
     if not isinstance(nets, dict) or set(nets) != {"maintenance", "emergency"}:
         die("networks must contain maintenance and emergency")
@@ -310,10 +316,53 @@ def qemu_net(cfg, nets):
     for key in nic_keys(cfg):
         run("qm", "set", vmid, f"--{key}", nets[key])
 
+def validate_export_destination(dest):
+    """Reject non-files before contacting the guest or changing VM hardware."""
+    dest = Path(dest)
+    if dest.is_symlink() or not dest.parent.is_dir() or (
+            dest.exists() and not dest.is_file()):
+        die("Export destination must be a regular file (or absent), not a symlink or directory")
+    return dest
+
+
+def verify_iso_storage(cfg, name):
+    """Check that PVE's ISO volume refers to the file we actually generated."""
+    volume = f"{cfg['iso_storage']}:iso/{name}"
+    path = run("pvesm", "path", volume, capture=True).decode().strip()
+    if Path(path).resolve() != (Path(cfg["iso_dir"]) / name).resolve():
+        die(f"ISO storage mismatch: {volume} resolves to {path}, not iso_dir")
+    return volume
+
+
+def verify_optical_slot(actual):
+    """Never detach an unrelated device silently."""
+    match = re.search(r"^ide2:\s*(.+)$", actual, flags=re.M)
+    if match and "media=cdrom" not in match.group(1).split(",")[1:]:
+        die("ide2 is occupied by a non-CD-ROM device; refusing to replace it")
+
+
+
+def ssh_nonretryable_error(returncode, stderr):
+    """Do not repeat rejected logins: retries can trigger CrowdSec SSH bans."""
+    if returncode != 255:
+        return False
+    message = stderr.lower()
+    return any(marker in message for marker in (
+        "permission denied (",
+        "too many authentication failures",
+        "authentication failed",
+        "host key verification failed",
+        "remote host identification has changed",
+    ))
+
+
 def maintenance_export(cfg, dest):
+    dest = validate_export_destination(dest)
     remote = f"{cfg['maintenance_ssh_user']}@{cfg['maintenance_ssh_host']}"
     argv = ["ssh", "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=5"]
+    if cfg.get("maintenance_ssh_port") is not None:
+        argv += ["-p", str(cfg["maintenance_ssh_port"])]
     # Explicit key file stays supported; otherwise defer entirely to OpenSSH,
     # including SSH_AUTH_SOCK and a forwarded ssh-agent. No private key on PVE required.
     identity = cfg.get("ssh_identity")
@@ -329,23 +378,43 @@ def maintenance_export(cfg, dest):
                                timeout=12, check=False)
             if p.returncode == 0:
                 raw = validate_xml(p.stdout, "Export from guest VM")
-                dest = Path(dest)
-                if dest.is_symlink() or not dest.parent.is_dir():
-                    die("Export destination must not be a symbolic link and its parent directory must exist")
-                if dest.exists():
-                    if not ask(f"{dest} exists. Archive and replace the old file?", False):
-                        die("Export cancelled; guest copy remains in /conf/spare/emergency.xml")
-                    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                    backup = dest.with_name(dest.name + f".{stamp}.bak")
-                    if backup.exists():
-                        die("Archive file already exists")
-                    os.replace(dest, backup)
-                    os.chmod(backup, 0o600)
-                    print(f"Previous transfer file archived: {backup}")
-                atomic_bytes(dest, raw)
+                validate_export_destination(dest)
+                # Prepare the replacement BEFORE touching the existing export.
+                fd, staged = tempfile.mkstemp(prefix=".spare-export-", dir=dest.parent)
+                try:
+                    with os.fdopen(fd, "wb") as fp:
+                        os.fchmod(fp.fileno(), 0o600)
+                        fp.write(raw)
+                        fp.flush()
+                        os.fsync(fp.fileno())
+                    validate_export_destination(dest)
+                    if dest.exists():
+                        if not ask(f"{dest} exists. Archive and replace the old file?", False):
+                            die("Export cancelled; guest copy remains in /conf/spare/emergency.xml")
+                        validate_export_destination(dest)
+                        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                        backup = dest.with_name(dest.name + f".{stamp}.bak")
+                        # Hard-link the existing inode without removing its live pathname.
+                        # Exclusive creation refuses to overwrite an existing backup.
+                        os.link(dest, backup, follow_symlinks=False)
+                        os.chmod(backup, 0o600)
+                        print(f"Previous transfer file archived: {backup}")
+                    validate_export_destination(dest)
+                    os.replace(staged, dest)
+                    dirfd = os.open(dest.parent, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(dirfd)
+                    finally:
+                        os.close(dirfd)
+                finally:
+                    if os.path.exists(staged):
+                        os.unlink(staged)
                 print(f"Emergency configuration exported: {dest} (SHA256 {hashlib.sha256(raw).hexdigest()})")
                 return
             err = p.stderr.decode(errors="replace").strip()[-300:]
+            if ssh_nonretryable_error(p.returncode, err):
+                die("Export aborted: SSH authentication or host-key verification failed. "
+                    f"Not retrying to avoid lockouts. SSH: {err}")
         except subprocess.TimeoutExpired:
             err = "SSH timeout"
         time.sleep(2)
@@ -378,6 +447,8 @@ def main():
         status = vm_status(vmid)
         current = vm_config(vmid)
         transfer = Path(args.transfer) if args.transfer else None
+        if transfer is not None and args.mode == "maintenance":
+            validate_export_destination(transfer)
         if transfer is not None and args.mode == "emergency":
             validate_xml(require_file(transfer).read_bytes(), str(transfer))
 
@@ -397,6 +468,7 @@ def main():
         if status != "stopped":
             die(f"Unexpected VM status {status!r}; VM must be stopped")
 
+        verify_optical_slot(current)
         actual_slots = {k for k in vm_net_and_iso(current) if k != "iso_volume"}
         if actual_slots != set(nic_keys(cfg)):
             die("VM NIC inventory differs from JSON. Configure exactly net0..netN "
@@ -438,6 +510,8 @@ def main():
         # Do not start a VM after an unsuccessful or only partly applied qm set.
         ident, name, iso = make_iso(cfg, args.mode,
                                     transfer if args.mode == "emergency" else None)
+        # Verify the PVE volume maps to the freshly generated file before qm mutation.
+        verify_iso_storage(cfg, name)
         try:
             qemu_net(cfg, networks)
             run("qm", "set", vmid, "--ide2", f"{cfg['iso_storage']}:iso/{name},media=cdrom")

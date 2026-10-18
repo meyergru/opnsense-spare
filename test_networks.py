@@ -85,6 +85,16 @@ class UniversalTopologyTest(unittest.TestCase):
                            for k,v in nets.items())+f'ide2: local:iso/{iso},media=cdrom\n'
             spare.verify_hardware(c,actual,nets,iso)
 
+    def test_guest_failed_boot_path_and_commit_order(self):
+        guest = (HERE / '90-opnsense-spare').read_text()
+        self.assertIn("trap 'fail \"Unexpected boot hook exit\"' EXIT", guest)
+        self.assertIn('trap - EXIT', guest)
+        self.assertIn('ln "$ARCHIVE.new" "$ARCHIVE"', guest)
+        # A completed transition must record the request before removing its marker.
+        transaction = guest[guest.index('    # Commit the request while'): ]
+        self.assertLess(transaction.index('mv -f "$STORE/last-request.new" "$STORE/last-request"'),
+                        transaction.index('rm -f "$STORE/transition"'))
+
     def test_guest_script_syntax_and_early_mapping(self):
         path=HERE/'90-opnsense-spare'
         subprocess.run(['sh','-n',str(path)],check=True)

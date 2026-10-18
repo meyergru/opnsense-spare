@@ -1,0 +1,17 @@
+name: Regression tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python and shell syntax
+        run: |
+          python3 -m py_compile opnsense-spare test_host.py test_networks.py test_guest.py
+          sh -n 90-opnsense-spare
+      - name: Controller and mapping regression tests
+        run: python3 -m unittest -v test_host test_networks test_guest

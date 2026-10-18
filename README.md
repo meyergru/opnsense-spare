@@ -130,12 +130,14 @@ opnsense-spare maintenance --transfer /path/to/failback.xml
 - **Isolated test:** `--link-down` disconnects *all* emergency NICs. The physical firewall may remain running. Inspect the VM through the Proxmox console.
 - **Live takeover:** `--link-up` connects emergency NICs and explicitly asks you to confirm that the physical firewall is off or isolated. The controller does not detect or perform failover automatically.
 - **Start or prepare:** A successful mode command offers to start the VM. Answer `n` to leave it stopped and **ready for a manual `qm start`**. It can later be stopped and reconfigured using the normal command; no history reconciliation is needed.
+- **Export destination:** Existing export destinations must be regular files (never directories or symlinks). New XML is staged before replacement; the previous export is retained as a timestamped backup.
+- **PVE storage safety:** Before changing VM hardware, the controller verifies that the generated ISO resolves to the configured PVE storage path and rejects a non-CD-ROM device at `ide2`. These checks require working `pvesm path` on the PVE host.
 - **Failback export:** `--transfer` with `maintenance` explicitly requests an SSH export of the saved **emergency** guest configuration *after* the maintenance VM boots. Without `--transfer`, there is no export prompt. You can also run `opnsense-spare maintenance --transfer /path/to/failback.xml` against an **already running maintenance VM**; this only exports, without modifying VM hardware. If you declined the VM start, do the export after manually starting it. Nothing is imported automatically on the physical firewall.
 - **Failed preparation:** `qm set` is not an atomic multi-NIC operation. The controller disables PVE autostart before changing NICs, and reads back **all** NIC definitions and the attached ISO before offering a VM start. If any operation fails, the controller will not start the VM. **Do not manually start it while partially configured**; inspect `qm config <VMID>` and rerun the desired mode command to apply the complete profile.
 
 The controller uses two stable ISO filenames (`opnsense-spare-<VMID>-maintenance.iso` and `opnsense-spare-<VMID>-emergency.iso`) and unique request IDs *inside* the ISO. Repeating preparation does not blindly reimport an earlier backup: importing requires an explicit `--transfer` on the new invocation. The guest hook still stores and selects the two persistent configurations.
 
-**No persistent host state file or recovery mode is needed.** Existing JSON files may retain the historical `state_file` and `transfer_default` keys, but the simplified controller ignores them. The old `/var/lib/opnsense-spare/state.json` is not read or modified; it is no longer authoritative. A transient lock under `/run/lock` prevents concurrent *controller* invocations. Use an explicit `--transfer` path when an import or export is wanted. The export uses an SSH agent (`"ssh_identity": null`) or configured identity file, with strict host-key verification.
+**No persistent host state file or recovery mode is needed.** Existing JSON files may retain the historical `state_file` and `transfer_default` keys, but the simplified controller ignores them. The old `/var/lib/opnsense-spare/state.json` is not read or modified; it is no longer authoritative. A transient lock under `/run/lock` prevents concurrent *controller* invocations. Use an explicit `--transfer` path when an import or export is wanted. During export, SSH authentication or host-key verification failures abort immediately to avoid triggering intrusion-prevention lockouts; temporary connection failures during guest startup are retried until the configured timeout. The export uses an SSH agent (`"ssh_identity": null`) or configured identity file, with strict host-key verification. Optional integer ports `maintenance_ssh_port` and `emergency_ssh_port` (1–65535, or `null`/omitted) can be set independently. The controller currently only uses SSH for maintenance failback export, so `maintenance_ssh_port` explicitly overrides the OpenSSH client default, while `emergency_ssh_port` is reserved for possible future Emergency-mode SSH operations and has no effect today. If unset, OpenSSH's own port configuration applies. For example, set `"maintenance_ssh_port": 22` if the PVE host normally uses port 3000.
 
 ## Safety notes
 
@@ -143,14 +145,14 @@ The controller uses two stable ISO filenames (`opnsense-spare-<VMID>-maintenance
 - Emergency switching is manual by design. `onboot=0` is enforced.
 - Validate the PVE bridge wiring, VLAN tagging/untagging, WAN connectivity (DHCP or PPPoE), gateway, routing, DHCP, VPN, and firewall behavior for *your* topology.
 - The mode ISO may contain a complete firewall configuration, **including secrets**. The controller creates the ISO with permission `0600`; protect PVE backups, snapshots, transfer files, and any old ISO images accordingly.
-- The guest hook fails closed on absent/invalid media, invalid mapping, source-name conflicts, or an interrupted profile transition. This may halt the VM and require console recovery.
+- The guest hook fails closed on absent/invalid media, invalid mapping, source-name conflicts, unexpected boot-hook failures, or an interrupted profile transition. A transition interrupted after configuration activation requires manual investigation using the OPNsense console; the marker is intentionally not cleared automatically. This may halt the VM and require console recovery.
 - An older EFI loader can fail before OPNsense hooks run. Verify loader compatibility after major upgrades.
 
 ## Tests and status
 
 ```sh
-python3 -m unittest -v test_host test_networks
-python3 -m py_compile opnsense-spare migrate-v5-config.py
+python3 -m unittest -v test_host test_networks test_guest
+python3 -m py_compile opnsense-spare test_host.py test_networks.py test_guest.py
 sh -n 90-opnsense-spare
 ```
 
@@ -164,5 +166,5 @@ The automated tests exercise stopped/running workflows, manual starts, declined 
 | `90-opnsense-spare` | Single OPNsense guest import hook (FreeBSD `/bin/sh`) |
 | `opnsense-spare.json.example` | Example two-NIC configuration |
 | `opnsense-spare-three-nic.json.example` | Example three-NIC topology |
-| `test_host.py`, `test_networks.py` | Unit and regression tests |
+| `test_host.py`, `test_networks.py`, `test_guest.py` | Unit, regression, and simulated guest boot tests |
 | `CHANGELOG.md` | Development history |
