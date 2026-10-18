@@ -6,7 +6,9 @@
 - Guest import commits `last-request` before clearing its transition marker; per-request emergency archives cannot be silently overwritten by retries.
 - Export preflight rejects directory/symlink destinations before VM mutation; new output is staged before atomically replacing the original while retaining a protected backup.
 - Controller validates PVE ISO volume resolution and refuses an occupied non-CD-ROM `ide2` slot.
-- Added host regression tests and corrected stale README compile command. No separate host state tracking was added.
+- Added host regression tests and corrected stale README compile command.
+- Added optional validated `maintenance_ssh_port` and `emergency_ssh_port` (unconfigured ports defer to OpenSSH settings). Only the maintenance export currently uses SSH; the emergency port is reserved.
+- Expanded CI with simulated real guest boot flows and SSH port regression tests. No separate host state tracking was added.
 
 ## Stateless Proxmox controller (2026-10-18)
 
