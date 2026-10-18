@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
-loader=importlib.machinery.SourceFileLoader('spare_v6', str(HERE/'opnsense-spare'))
+loader=importlib.machinery.SourceFileLoader('spare_controller', str(HERE/'opnsense-spare'))
 spec=importlib.util.spec_from_loader(loader.name,loader)
 spare=importlib.util.module_from_spec(spec)
 loader.exec_module(spare)
@@ -127,18 +127,6 @@ class UniversalTopologyTest(unittest.TestCase):
             self.assertEqual(spare.load_state(root/'state.json')['mode'],'maintenance')
             self.assertEqual(len(spare.load_state(root/'state.json')['prepared']['networks']),3)
             for net in current.values():self.assertIn('link_down=1',net)
-
-    def test_v5_converter_preserves_important_fields(self):
-        import importlib.util
-        spec=importlib.util.spec_from_file_location('migrate_v5',HERE/'migrate-v5-config.py')
-        mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
-        old=json.loads((HERE/'../opnsense-spare-v5-stub.json').read_text()) if (HERE/'../opnsense-spare-v5-stub.json').exists() else {
-            'vmid':999,'ssh_identity':None,'net0_maintenance':'A','net1_maintenance':'B',
-            'net0_emergency':'C','net1_emergency':'D', 'transfer_default':'/tmp/test'}
-        cfg=mod.convert(old,{'vtnet0':'ix1','vtnet1':'igc3'})
-        self.assertEqual(cfg['networks']['emergency']['net1'],'D')
-        self.assertEqual(cfg['transfer_default'],'/tmp/test')
-        self.assertEqual(cfg['interface_names']['vtnet0'],'ix1')
 
     def test_guest_hook_shell_syntax_and_boot_order_guards(self):
         path=HERE/'90-opnsense-spare'

@@ -13,7 +13,7 @@ Implementation milestones, listed newest first. Historical version labels are re
 - Maintenance NIC isolation checks, duplicate MAC/target name and VLAN preflight.
 - `--link-down`/`--link-up` now apply to **all Emergency NICs**.
 - Existing V5 pending export, prepared, boot idempotence, emergency import / archive, and ISO naming retained.
-- Includes optional V5->V6 JSON converter and three-NIC example.
+- Added a three-NIC configuration example.
 
 **Not tested on an actual FreeBSD/OPNsense V6 VM**. Run isolated maintenance smoke test before real emergency.
 

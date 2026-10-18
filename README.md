@@ -104,7 +104,7 @@ The controller supports contiguous VirtIO slots `net0` through `netN` (up to 32)
 - **Boot firmware:** Use Proxmox **OVMF (UEFI)** and add an **EFI disk** when creating the VM. The physical appliance may use legacy BIOS: importing its `config.xml` does not change the VM firmware or bootloader. Do not change a working VM from BIOS to UEFI (or vice versa) without preparing its boot disk.
 - **Add a serial port:** In the Proxmox GUI select **VM → Hardware → Add → Serial Port**, choose **socket**, port **0**. Alternatively, on the PVE host run `qm set <VMID> --serial0 socket` while the VM is stopped. Keep the VGA display available as well.
 - **Use the console:** `qm terminal <VMID>` on the PVE host opens the serial console. In the Proxmox web UI, **Hardware → Display → Serial terminal 0** makes **Console** open the serial terminal (xterm.js); retain a VGA display if you want the normal noVNC console instead. A serial port alone does not cause OPNsense to write output there: under **System → Settings → Administration → Console**, enable **Serial console** as the primary or secondary console and use 115200 baud. Verify access after importing the physical configuration, which may change that setting.
-- **CPU microcode:** The physical OPNsense may have an `os-cpu-microcode-*` plugin. The cold-spare import copies **XML only**: it does not itself transfer microcode binaries, install the plugin, or change the physical CPU. The imported configuration may still record installed plugins; do not subsequently synchronize/install a microcode plugin inside the guest. Inside a VM, microcode updates belong on the **Proxmox host**, not in the guest. Installing or forcing early microcode loading in the VM is unnecessary and can cause boot problems; do not copy hardware-specific loader settings blindly.
+- **CPU microcode:** The cold-spare import transfers only the XML configuration, not microcode binaries. A CPU microcode plugin listed in the physical firewall's configuration is not a reason to alter the imported XML: any update attempt inside the guest cannot update the physical CPU of the Proxmox host. Microcode management belongs to the host; installing or updating that plugin separately in the guest has no practical benefit.
 
 **Boot dependency:** The hook intentionally fails closed if its valid mode ISO is missing or the mapping is invalid. Keep Proxmox console access and a VM backup available.
 
@@ -145,7 +145,7 @@ The optional `--transfer` path refers to a **file on the PVE host**, not inside 
 
 ```sh
 python3 -m unittest -v test_host test_networks
-python3 -m py_compile opnsense-spare migrate-v5-config.py
+python3 -m py_compile opnsense-spare
 sh -n 90-opnsense-spare
 ```
 
