@@ -78,7 +78,7 @@ The controller supports contiguous VirtIO slots `net0` through `netN` (up to 32)
 
 ## New installation
 
-1. Create an OPNsense VM with all required VirtIO NIC slots. Do not enable automatic VM startup. Set up the PVE bridges and physical/VLAN transport paths beforehand.
+1. Create an OPNsense VM with **OVMF (UEFI)** firmware and an **EFI disk**, plus all required VirtIO NIC slots. Add a virtual serial port (`serial0: socket`) in addition to the VGA console. Do not enable automatic VM startup. Set up the PVE bridges and physical/VLAN transport paths beforehand.
 2. Install OPNsense and configure it as an ordinary **maintenance LAN client**, using an independent IP and MAC address and a default gateway through the physical firewall. Keep production network services disabled in maintenance mode. Align the maintenance configuration's interface names with `interface_names` in the host JSON.
 3. Install the **single import hook** in the guest and initialize the saved maintenance profile (keep PVE console access for the initial interface reassignment):
 
@@ -98,6 +98,13 @@ The controller supports contiguous VirtIO slots `net0` through `netN` (up to 32)
 
 5. Stop the VM, check `opnsense-spare maintenance --dry-run`, then run `opnsense-spare maintenance` and confirm VM startup. **At the PVE console**, correct any old `vtnetN` maintenance interface assignment to the configured physical name; then verify management IP, gateway, WebGUI, and SSH. Reboot once more to verify idempotence.
 6. Test emergency mode **with `--link-down` first**. Do not connect production MAC/IP addresses to the network while the physical firewall is online. Test the complete failback and export paths before using the spare in production.
+
+### Firmware, serial console and CPU microcode
+
+- **Boot firmware:** Use Proxmox **OVMF (UEFI)** and add an **EFI disk** when creating the VM. The physical appliance may use legacy BIOS: importing its `config.xml` does not change the VM firmware or bootloader. Do not change a working VM from BIOS to UEFI (or vice versa) without preparing its boot disk.
+- **Add a serial port:** In the Proxmox GUI select **VM → Hardware → Add → Serial Port**, choose **socket**, port **0**. Alternatively, on the PVE host run `qm set <VMID> --serial0 socket` while the VM is stopped. Keep the VGA display available as well.
+- **Use the console:** `qm terminal <VMID>` on the PVE host opens the serial console. In the Proxmox web UI, **Hardware → Display → Serial terminal 0** makes **Console** open the serial terminal (xterm.js); retain a VGA display if you want the normal noVNC console instead. A serial port alone does not cause OPNsense to write output there: under **System → Settings → Administration → Console**, enable **Serial console** as the primary or secondary console and use 115200 baud. Verify access after importing the physical configuration, which may change that setting.
+- **CPU microcode:** The physical OPNsense may have an `os-cpu-microcode-*` plugin. The cold-spare import copies **XML only**: it does not itself transfer microcode binaries, install the plugin, or change the physical CPU. The imported configuration may still record installed plugins; do not subsequently synchronize/install a microcode plugin inside the guest. Inside a VM, microcode updates belong on the **Proxmox host**, not in the guest. Installing or forcing early microcode loading in the VM is unnecessary and can cause boot problems; do not copy hardware-specific loader settings blindly.
 
 **Boot dependency:** The hook intentionally fails closed if its valid mode ISO is missing or the mapping is invalid. Keep Proxmox console access and a VM backup available.
 
@@ -154,4 +161,3 @@ The automated tests exercise controller state transitions, imports/exports, ISO 
 | `opnsense-spare-three-nic.json.example` | Example three-NIC topology |
 | `test_host.py`, `test_networks.py` | Unit and regression tests |
 | `CHANGELOG.md` | Development history |
-
