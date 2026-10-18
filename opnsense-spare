@@ -161,6 +161,12 @@ def validate_config(cfg):
         die("maintenance_ssh_host must be configured in JSON")
     if cfg.get("ssh_identity") is not None and not isinstance(cfg["ssh_identity"], str):
         die("ssh_identity must be a path, null, or omitted")
+    # Optional mode-specific SSH ports. No explicit port means OpenSSH uses
+    # its existing client configuration (including ~/.ssh/config).
+    for name in ("maintenance_ssh_port", "emergency_ssh_port"):
+        port = cfg.get(name)
+        if port is not None and (type(port) is not int or not 1 <= port <= 65535):
+            die(f"{name} must be an integer between 1 and 65535, null, or omitted")
     nets = cfg["networks"]
     if not isinstance(nets, dict) or set(nets) != {"maintenance", "emergency"}:
         die("networks must contain maintenance and emergency")
@@ -340,6 +346,8 @@ def maintenance_export(cfg, dest):
     remote = f"{cfg['maintenance_ssh_user']}@{cfg['maintenance_ssh_host']}"
     argv = ["ssh", "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=5"]
+    if cfg.get("maintenance_ssh_port") is not None:
+        argv += ["-p", str(cfg["maintenance_ssh_port"])]
     # Explicit key file stays supported; otherwise defer entirely to OpenSSH,
     # including SSH_AUTH_SOCK and a forwarded ssh-agent. No private key on PVE required.
     identity = cfg.get("ssh_identity")
