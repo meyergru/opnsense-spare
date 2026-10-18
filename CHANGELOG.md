@@ -7,6 +7,7 @@
 - Export preflight rejects directory/symlink destinations before VM mutation; new output is staged before atomically replacing the original while retaining a protected backup.
 - Controller validates PVE ISO volume resolution and refuses an occupied non-CD-ROM `ide2` slot.
 - Added host regression tests and corrected stale README compile command.
+- Export SSH authentication and host-key failures now stop immediately rather than repeating failed logins; transient connection errors retain the bounded startup retry. Added regression tests for both paths.
 - Added optional validated `maintenance_ssh_port` and `emergency_ssh_port` (unconfigured ports defer to OpenSSH settings). Only the maintenance export currently uses SSH; the emergency port is reserved.
 - Expanded CI with simulated real guest boot flows and SSH port regression tests. No separate host state tracking was added.
 
