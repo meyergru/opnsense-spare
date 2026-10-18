@@ -4,6 +4,11 @@ A **cold standby OPNsense virtual machine** that can temporarily replace a physi
 
 > **Development status:** Python unit tests and shell syntax checks have passed, but **the current implementation has not yet undergone a complete OPNsense/FreeBSD and Proxmox integration test**. In particular, the consolidated import hook's NIC renaming and the end-to-end WAN and failback operations must be verified on the target system before relying on it for disaster recovery. Keep a working backup and out-of-band console access.
 
+## Tutorial and forum discussions
+
+- [Step-by-step tutorial on the OPNsense forum](https://forum.opnsense.org/index.php?topic=53175) — installation and configuration of the virtual cold spare.
+- [Proxmox forum discussion](https://forum.proxmox.com/threads/virtual-cold-spare-for-a-physical-opnsense-using-proxmox.187127/) — discussion and reference for Proxmox users.
+
 ## How it works
 
 The Proxmox controller (`opnsense-spare`) configures the VM's VirtIO NICs and attaches a small, read-only, mode-specific ISO. During OPNsense boot, a single early **import hook** (`90-opnsense-spare`) reads that ISO *before network services initialize*.
