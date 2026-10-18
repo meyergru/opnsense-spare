@@ -232,6 +232,51 @@ class StatelessControllerTests(unittest.TestCase):
                 h.invoke('emergency',['--link-down'],error='did not attach')
             self.assertEqual(h.count(('qm','start')),0)
 
+    def test_ssh_authentication_errors_abort_without_retry(self):
+        errors = (
+            "root@192.168.10.99: Permission denied (publickey).",
+            "Received disconnect: Too many authentication failures",
+            "Authentication failed.",
+            "Host key verification failed.",
+            "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Harness(self, root).cfg
+            cfg["ssh_timeout_seconds"] = 90
+            for error in errors:
+                with self.subTest(error=error):
+                    dest = root / "failure.xml"
+                    response = MagicMock(returncode=255, stdout=b"",
+                                         stderr=error.encode())
+                    with patch.object(spare.subprocess, "run", return_value=response) as ssh, \
+                         patch.object(spare.time, "sleep") as sleep:
+                        with self.assertRaisesRegex(RuntimeError, "Not retrying"):
+                            spare.maintenance_export(cfg, dest)
+                        ssh.assert_called_once()
+                        sleep.assert_not_called()
+                    self.assertFalse(dest.exists())
+
+    def test_ssh_transient_failure_retries_and_export_succeeds(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = Harness(self, root).cfg
+            dest = root / "recovered.xml"
+            failure = MagicMock(returncode=255, stdout=b"",
+                                stderr=b"ssh: connect to host 192.168.10.99 port 22: Connection refused")
+            success = MagicMock(returncode=0, stdout=EXAMPLE, stderr=b"")
+            with patch.object(spare.subprocess, "run", side_effect=[failure, success]) as ssh, \
+                 patch.object(spare.time, "sleep") as sleep:
+                spare.maintenance_export(cfg, dest)
+            self.assertEqual(ssh.call_count, 2)
+            sleep.assert_called_once_with(2)
+            self.assertEqual(dest.read_bytes(), EXAMPLE)
+
+    def test_remote_command_errors_not_misclassified_as_auth(self):
+        self.assertFalse(spare.ssh_nonretryable_error(1, "Permission denied (publickey)."))
+        self.assertFalse(spare.ssh_nonretryable_error(255, "Connection timed out"))
+        self.assertFalse(spare.ssh_nonretryable_error(255, "Connection refused"))
+
     def test_export_rejects_directory_without_ssh_or_vm_mutation(self):
         with tempfile.TemporaryDirectory() as td:
             h = Harness(self, Path(td))
