@@ -4,6 +4,8 @@
   "iso_storage": "local",
   "maintenance_ssh_host": "192.0.2.10",
   "maintenance_ssh_user": "root",
+  "maintenance_ssh_port": null,
+  "emergency_ssh_port": null,
   "ssh_identity": null,
   "ssh_timeout_seconds": 90,
   "maintenance_client_nic": "net0",
