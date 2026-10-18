@@ -1,5 +1,13 @@
 # Changelog
 
+## Defensive review hardening (2026-10-18)
+
+- Guest boot errors now use an EXIT safety trap and a nonreturning, best-effort failure handler; successful boots explicitly disarm the trap.
+- Guest import commits `last-request` before clearing its transition marker; per-request emergency archives cannot be silently overwritten by retries.
+- Export preflight rejects directory/symlink destinations before VM mutation; new output is staged before atomically replacing the original while retaining a protected backup.
+- Controller validates PVE ISO volume resolution and refuses an occupied non-CD-ROM `ide2` slot.
+- Added host regression tests and corrected stale README compile command. No separate host state tracking was added.
+
 ## Stateless Proxmox controller (2026-10-18)
 
 - Removed persistent host mode, prepared, pending-export, and incomplete-transition tracking; PVE is the authority for VM status and hardware configuration.
