@@ -94,6 +94,47 @@ class StatelessControllerTests(unittest.TestCase):
                   valid.replace('50-56','56-50'),valid.replace('1;4','1;;4')):
             with self.assertRaises(RuntimeError):spare.parse_net_profile('net0',s)
 
+    def test_optional_ssh_ports_validate_without_changing_defaults(self):
+        with tempfile.TemporaryDirectory() as td:
+            h = Harness(self, Path(td))
+            spare.validate_config(h.cfg)
+            for name in ("maintenance_ssh_port", "emergency_ssh_port"):
+                for value in (1, 22, 3000, 65535, None):
+                    cfg = dict(h.cfg, **{name: value})
+                    spare.validate_config(cfg)
+                for value in (0, 65536, -1, "22", 22.0, True, False, [], {}):
+                    cfg = dict(h.cfg, **{name: value})
+                    with self.subTest(parameter=name, invalid=value):
+                        with self.assertRaisesRegex(RuntimeError, name):
+                            spare.validate_config(cfg)
+
+    def test_export_ssh_port_overrides_client_config_when_set(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            h = Harness(self, root)
+            destination = root / "export.xml"
+            xml = b"<opnsense><test/></opnsense>"
+            commands = []
+            def fake_ssh(argv, **kwargs):
+                commands.append(list(argv))
+                p = MagicMock()
+                p.returncode = 0
+                p.stdout = xml
+                return p
+            with patch.object(spare.subprocess, "run", side_effect=fake_ssh):
+                spare.maintenance_export(h.cfg, destination)
+            self.assertNotIn("-p", commands[0])
+            self.assertEqual(destination.read_bytes(), xml)
+            destination.unlink()
+            h.cfg["maintenance_ssh_port"] = 22
+            h.cfg["emergency_ssh_port"] = 3000
+            commands.clear()
+            with patch.object(spare.subprocess, "run", side_effect=fake_ssh):
+                spare.maintenance_export(h.cfg, destination)
+            self.assertIn(["-p", "22"], [commands[0][i:i+2] for i in range(len(commands[0])-1)])
+            self.assertNotIn("3000", commands[0])
+            self.assertEqual(destination.read_bytes(), xml)
+
     def test_iso_contains_checksums_and_new_ids(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); imported=root/'source.xml'; imported.write_bytes(EXAMPLE)
