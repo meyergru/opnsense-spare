@@ -2,7 +2,7 @@
 
 A **cold standby OPNsense virtual machine** that can temporarily replace a physical OPNsense firewall, while normally operating as an independent maintenance client. The project is **not** a CARP/pfsync high-availability cluster and does not provide automatic failover.
 
-> **Development status:** Python unit tests and shell syntax checks have passed, but **the current implementation has not yet undergone a complete OPNsense/FreeBSD and Proxmox integration test**. In particular, the consolidated import hook's NIC renaming and the end-to-end WAN and failback operations must be verified on the target system before relying on it for disaster recovery. Keep a working backup and out-of-band console access.
+> **Test status:** A live failover from a physical OPNsense to the Proxmox VM succeeded on 18 October 2026. The simplified host controller has automated regression tests; its revised workflow still needs validation on a real PVE host before operational reliance. Keep a working backup and out-of-band console access.
 
 ## Tutorial and forum discussions
 
@@ -115,27 +115,27 @@ The controller supports contiguous VirtIO slots `net0` through `netN` (up to 32)
 
 ## Operation
 
-Run on the **Proxmox host as root**; except for a retry of a pending export, the VM must be stopped:
+Run on the **Proxmox host as root**. Mode changes require the VM to be **stopped**. The controller reads the current PVE configuration instead of keeping a separate persistent host state: a VM prepared by the script may be started manually with `qm start <VMID>`.
 
 ```sh
 opnsense-spare maintenance
 opnsense-spare emergency --link-down --transfer /path/to/physical-config.xml
 opnsense-spare emergency --link-up --transfer /path/to/physical-config.xml
+opnsense-spare emergency --link-up                     # reuse saved emergency profile
 opnsense-spare maintenance --transfer /path/to/failback.xml
-opnsense-spare emergency --recover-incomplete
 ```
 
-- **Maintenance** connects the VM as a LAN client with its own MAC and addressing. It may coexist with the physical firewall.
-- **Emergency** uses the configured production MAC addresses and network mapping. On entry, the controller asks whether to import an external `config.xml`. Declining import activates the saved emergency profile instead.
-- **Isolated emergency testing:** `--link-down` sets `link_down=1` on all VM NICs, allowing guest boot and configuration tests while the physical firewall remains active. Use the PVE console.
-- **Live emergency operation:** `--link-up` enables all emergency links and requires operator confirmation that the physical firewall is off and the WAN/network cabling has been moved as appropriate.
-- **Failback:** when switching from emergency to maintenance, the controller offers to copy the guest's saved emergency profile to a file on the PVE host using SSH. The transfer can be retried after a failure or explicitly skipped. It never automatically imports that configuration on the physical firewall.
-- **Declined VM start:** answering `n` to the start prompt leaves a `prepared` state, not an error. Do not manually start a prepared VM without reconciling guest/host state.
-- **Recovery:** `--recover-incomplete` examines an interrupted transition. It cannot safely resolve every partial failure; do not manually edit `state.json` as a shortcut.
+- **Maintenance** attaches an independently addressed LAN-client profile. The VM may coexist with the physical firewall. Its guest configuration is restored from the guest's saved maintenance profile.
+- **Emergency** configures the production MAC addresses and Layer-2 mapping. For an initial emergency activation, use **`--transfer /path/to/physical-config.xml`** to import a physical firewall backup. Without that flag, the guest uses its **previously saved emergency profile**, if one exists. No import is inferred from a default file path.
+- **Isolated test:** `--link-down` disconnects *all* emergency NICs. The physical firewall may remain running. Inspect the VM through the Proxmox console.
+- **Live takeover:** `--link-up` connects emergency NICs and explicitly asks you to confirm that the physical firewall is off or isolated. The controller does not detect or perform failover automatically.
+- **Start or prepare:** A successful mode command offers to start the VM. Answer `n` to leave it stopped and **ready for a manual `qm start`**. It can later be stopped and reconfigured using the normal command; no history reconciliation is needed.
+- **Failback export:** `--transfer` with `maintenance` explicitly requests an SSH export of the saved **emergency** guest configuration *after* the maintenance VM boots. Without `--transfer`, there is no export prompt. You can also run `opnsense-spare maintenance --transfer /path/to/failback.xml` against an **already running maintenance VM**; this only exports, without modifying VM hardware. If you declined the VM start, do the export after manually starting it. Nothing is imported automatically on the physical firewall.
+- **Failed preparation:** `qm set` is not an atomic multi-NIC operation. The controller disables PVE autostart before changing NICs, and reads back **all** NIC definitions and the attached ISO before offering a VM start. If any operation fails, the controller will not start the VM. **Do not manually start it while partially configured**; inspect `qm config <VMID>` and rerun the desired mode command to apply the complete profile.
 
-The controller uses two stable ISO filenames (`opnsense-spare-<VMID>-maintenance.iso` and `opnsense-spare-<VMID>-emergency.iso`) and unique request IDs *inside* the ISO. Old per-request ISOs from prior versions are not removed automatically.
+The controller uses two stable ISO filenames (`opnsense-spare-<VMID>-maintenance.iso` and `opnsense-spare-<VMID>-emergency.iso`) and unique request IDs *inside* the ISO. Repeating preparation does not blindly reimport an earlier backup: importing requires an explicit `--transfer` on the new invocation. The guest hook still stores and selects the two persistent configurations.
 
-The optional `--transfer` path refers to a **file on the PVE host**, not inside the guest. Set `transfer_default` in JSON to avoid repeating it. The maintenance export supports an SSH agent (`"ssh_identity": null`) and strict host-key verification.
+**No persistent host state file or recovery mode is needed.** Existing JSON files may retain the historical `state_file` and `transfer_default` keys, but the simplified controller ignores them. The old `/var/lib/opnsense-spare/state.json` is not read or modified; it is no longer authoritative. A transient lock under `/run/lock` prevents concurrent *controller* invocations. Use an explicit `--transfer` path when an import or export is wanted. The export uses an SSH agent (`"ssh_identity": null`) or configured identity file, with strict host-key verification.
 
 ## Safety notes
 
@@ -150,11 +150,11 @@ The optional `--transfer` path refers to a **file on the PVE host**, not inside 
 
 ```sh
 python3 -m unittest -v test_host test_networks
-python3 -m py_compile opnsense-spare
+python3 -m py_compile opnsense-spare migrate-v5-config.py
 sh -n 90-opnsense-spare
 ```
 
-The automated tests exercise controller state transitions, imports/exports, ISO generation, VLAN validation, and two-/three-NIC configurations. They are **not** a substitute for a real OPNsense boot, WAN cutover, and failback test.
+The automated tests exercise stopped/running workflows, manual starts, declined starts, explicit imports/exports, interrupted `qm set`, hardware read-back, ISO generation, VLAN validation, and two-/three-NIC configurations. They are **not** a substitute for the complete live cutover and failback test on your own topology.
 
 ### Project files
 

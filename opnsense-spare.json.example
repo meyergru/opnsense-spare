@@ -2,8 +2,6 @@
   "vmid": 999,
   "iso_dir": "/var/lib/vz/template/iso",
   "iso_storage": "local",
-  "state_file": "/var/lib/opnsense-spare/state.json",
-  "transfer_default": "/root/opnsense-transfer/config.xml",
   "maintenance_ssh_host": "192.0.2.10",
   "maintenance_ssh_user": "root",
   "ssh_identity": null,

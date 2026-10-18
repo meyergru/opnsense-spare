@@ -1,5 +1,14 @@
 # Changelog
 
+## Stateless Proxmox controller (2026-10-18)
+
+- Removed persistent host mode, prepared, pending-export, and incomplete-transition tracking; PVE is the authority for VM status and hardware configuration.
+- VM starts may be declined and later performed manually with `qm start`; no subsequent reconciliation or recovery flag is necessary.
+- Configuration import/export requires explicit `--transfer`; an export-only retry can run while the VM is already in maintenance mode.
+- Disables PVE autostart before NIC changes, and verifies every applied NIC and the attached mode ISO before starting the VM; failed partial hardware updates never trigger a start.
+- Kept the OPNsense guest boot hook and both mode ISO formats unchanged.
+- Updated examples and regression tests for two-/three-NIC layouts and manual cutover/failback workflows.
+
 Implementation milestones, listed newest first. Historical version labels are retained here for reference; the current controller and documentation are not version-specific.
 
 ## V6 — Universal network mappings (2026-10-18)

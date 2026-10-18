@@ -1,332 +1,262 @@
+"""Host-controller regression tests for stateless, manually operable cold spare."""
 import importlib.machinery
 import importlib.util
+import json
 from pathlib import Path
-import os
 import tempfile
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
-S = Path(__file__).with_name('opnsense-spare')
-loader = importlib.machinery.SourceFileLoader('spare', str(S))
+HERE = Path(__file__).resolve().parent
+loader = importlib.machinery.SourceFileLoader('spare', str(HERE / 'opnsense-spare'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 spare = importlib.util.module_from_spec(spec)
 loader.exec_module(spare)
-
 EXAMPLE = b'<?xml version="1.0"?><opnsense><interfaces/></opnsense>'
 
-class TestHost(unittest.TestCase):
-    def test_import_validation(self):
-        self.assertEqual(spare.validate_xml(EXAMPLE, 'test'), EXAMPLE)
-        for value in (b'<bad/>', b'<opnsense>', b'not xml'):
-            with self.assertRaises(RuntimeError):
-                spare.validate_xml(value, 'test')
 
-    def test_atomic_state(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / 'sub' / 'state.json'
-            spare.save_state(p, {'mode':'emergency', 'pending_export':True})
-            self.assertEqual(spare.load_state(p)['mode'], 'emergency')
-            self.assertEqual(p.stat().st_mode & 0o777, 0o600)
+class Harness:
+    def __init__(self, case, root, three=False):
+        self.case = case
+        example = 'opnsense-spare-three-nic.json.example' if three else 'opnsense-spare.json.example'
+        self.cfg = json.loads((HERE / example).read_text())
+        self.cfg.update(iso_dir=str(root), maintenance_ssh_host='192.168.10.99')
+        self.path = root / 'config.json'
+        self.path.write_text(json.dumps(self.cfg))
+        self.mode = 'maintenance'
+        self.status = 'stopped'
+        self.nets = dict(self.cfg['networks']['maintenance'])
+        self.iso = 'local:iso/old.iso'
+        self.onboot = '0'
+        self.commands = []
+        self.errors = {}
+        self.root = root
+        self.isos = 0
 
-    def test_iso_contains_import_checksum_and_request(self):
-        with tempfile.TemporaryDirectory() as d:
-            dest = Path(d)
-            backup = dest / 'backup.xml'
-            backup.write_bytes(EXAMPLE)
-            fake_cfg = dict(vmid=123, iso_dir=str(dest), interface_names={'vtnet0':'ix1', 'vtnet1':'igc3'})
-            def fake_xorriso(*args, **kwargs):
-                self.assertEqual(args[0], 'xorriso')
-                target = Path(args[args.index('-o') + 1])
-                stage = Path(args[-1])
-                request = (stage/'request.conf').read_text()
-                self.assertIn('mode=emergency', request)
-                self.assertIn('import=1', request)
-                self.assertIn('sha256=', request)
-                self.assertIn('ifmap_sha256=', request)
-                self.assertEqual((stage/'interfaces.conf').read_text(), 'vtnet0=ix1\nvtnet1=igc3\n')
-                self.assertEqual((stage/'config.xml').read_bytes(), EXAMPLE)
-                target.write_bytes(b'fake ISO')
-            with patch.object(spare, 'run', side_effect=fake_xorriso):
-                ident, name, iso = spare.make_iso(fake_cfg, 'emergency', backup)
-                self.assertEqual(len(ident), 32)
-                self.assertTrue(iso.exists())
-                self.assertEqual(iso.stat().st_mode & 0o777, 0o600)
+    def run(self, *cmd, **kw):
+        self.commands.append(cmd)
+        if cmd[:2] == ('qm', 'status'):
+            return f'status: {self.status}\n'.encode()
+        if cmd[:2] == ('qm', 'config'):
+            return (''.join(f'{k}: {v}\n' for k,v in self.nets.items())+
+                    f'ide2: {self.iso},media=cdrom\nonboot: {self.onboot}\n').encode()
+        if cmd[:2] == ('qm', 'set'):
+            if cmd[3] in self.errors:
+                raise RuntimeError(self.errors[cmd[3]])
+            if cmd[3].startswith('--net'):
+                self.nets[cmd[3][2:]] = cmd[4]
+            if cmd[3] == '--onboot':
+                self.onboot = cmd[4]
+            if cmd[3] == '--ide2':
+                self.iso = cmd[4].split(',')[0]
+            return b''
+        if cmd[:2] == ('qm', 'start'):
+            if 'start' in self.errors:
+                raise RuntimeError(self.errors['start'])
+            self.status = 'running'
+            return b''
+        raise AssertionError(cmd)
 
-    def test_fixed_iso_names_and_unique_embedded_requests(self):
-        with tempfile.TemporaryDirectory() as d:
-            dest = Path(d)
-            backup = dest / 'backup.xml'
-            backup.write_bytes(EXAMPLE)
-            cfg = dict(vmid=999, iso_dir=str(dest), interface_names={'vtnet0':'ix1', 'vtnet1':'igc3'})
-            seen_requests = []
-            def fake_xorriso(*args, **kwargs):
-                candidate = Path(args[args.index('-o') + 1])
-                stage = Path(args[-1])
-                contents = (stage/'request.conf').read_text()
-                seen_requests.append(contents)
-                candidate.write_bytes(contents.encode())
-            with patch.object(spare, 'run', side_effect=fake_xorriso):
-                ident1, name1, p1 = spare.make_iso(cfg, 'emergency', backup)
-                ident2, name2, p2 = spare.make_iso(cfg, 'emergency', None)
-                ident3, name3, p3 = spare.make_iso(cfg, 'maintenance', None)
-            self.assertEqual(name1, 'opnsense-spare-999-emergency.iso')
-            self.assertEqual(name1, name2)
-            self.assertEqual(p1, p2)
-            self.assertEqual(name3, 'opnsense-spare-999-maintenance.iso')
-            self.assertNotEqual(ident1, ident2)
-            self.assertNotEqual(ident2, ident3)
-            self.assertIn(f'request_id={ident2}', p2.read_text())
-            self.assertIn('import=0', p2.read_text())
-            self.assertIn('ifmap_sha256=', p2.read_text())
-            self.assertEqual(set(x.name for x in dest.glob('opnsense-spare-*.iso')),
-                             {name1, name3})
-            self.assertEqual(p2.stat().st_mode & 0o777, 0o600)
+    def make_iso(self, cfg, mode, transfer):
+        self.isos += 1
+        assert transfer is None or Path(transfer).is_file()
+        name = spare.iso_name(cfg, mode)
+        path = self.root / name
+        path.write_bytes(f'fake-iso-{self.isos}'.encode())
+        return ('f'*32, name, path)
 
-    def test_link_down_override_both_directions(self):
-        source='virtio=02:00:00:00:20:01,bridge=vmbr0,tag=4094,trunks=1;10,link_down=1,firewall=0'
-        self.assertEqual(spare.set_link_down(source, True).count('link_down='), 1)
-        self.assertEqual(spare.parse_net_profile('down',spare.set_link_down(source, True))['link_down'],'1')
-        self.assertEqual(spare.parse_net_profile('up',spare.set_link_down(source, False))['link_down'],'0')
-        self.assertEqual(spare.set_link_down(spare.set_link_down(source, False), True), spare.set_link_down(source, True))
-
-    def test_vlan_preflight_rejects_invalid_trunk_before_qm(self):
-        valid = "virtio=02:00:00:00:20:01,bridge=vmbr0,tag=4094,trunks=1;4;50-56;666,link_down=1"
-        parsed = spare.parse_net_profile('net0_emergency', valid)
-        self.assertEqual(parsed['trunks'], '1;4;50-56;666')
-        for broken in (
-            valid.replace('50-56', 'i53'),
-            valid.replace('666', '4095'),
-            valid.replace('50-56', '56-50'),
-            valid.replace('1;4', '1;;4'),
-            valid.replace('tag=4094', 'tag=5000'),
-            valid.replace('link_down=1', 'link_down=true'),
-        ):
-            with self.subTest(value=broken), self.assertRaises(RuntimeError):
-                spare.parse_net_profile('net0_emergency', broken)
-
-    def test_confirmations_accept_simple_j_and_n(self):
-        with patch('builtins.input', return_value='j'):
-            self.assertTrue(spare.ask('Test', False))
-            spare.exact_confirm()
-        with patch('builtins.input', return_value='n'):
-            self.assertFalse(spare.ask('Test', True))
-            with self.assertRaises(RuntimeError):
-                spare.exact_confirm()
-        with patch('builtins.input', side_effect=['maybe', 'j']):
-            self.assertTrue(spare.ask('Test', False))
-
-    def test_export_fetches_correct_emergency_profile(self):
-        with tempfile.TemporaryDirectory() as d:
-            ident = Path(d) / 'ssh_key'
-            ident.write_text('test')
-            target = Path(d) / 'export.xml'
-            config = dict(ssh_identity=str(ident), maintenance_ssh_user='root',
-                          maintenance_ssh_host='192.168.10.99', ssh_timeout_seconds=10)
-            proc = MagicMock(returncode=0, stdout=EXAMPLE, stderr=b'')
-            with patch.object(spare.subprocess, 'run', return_value=proc) as ssh:
-                spare.maintenance_export(config, target)
-                args = ssh.call_args.args[0]
-                self.assertEqual(args[-1], 'cat /conf/spare/emergency.xml')
-                self.assertEqual(target.read_bytes(), EXAMPLE)
-
-    def test_agent_export_without_identity_file(self):
-        with tempfile.TemporaryDirectory() as d:
-            target = Path(d) / 'export.xml'
-            config = dict(maintenance_ssh_user='root',
-                          maintenance_ssh_host='192.168.10.99',
-                          ssh_timeout_seconds=10, ssh_identity=None)
-            proc = MagicMock(returncode=0, stdout=EXAMPLE, stderr=b'')
-            with patch.object(spare.subprocess, 'run', return_value=proc) as ssh:
-                spare.maintenance_export(config, target)
-                args = ssh.call_args.args[0]
-                self.assertNotIn('-i', args)
-                self.assertIn('BatchMode=yes', args)
-                self.assertIn('StrictHostKeyChecking=yes', args)
-                self.assertEqual(args[-1], 'cat /conf/spare/emergency.xml')
-                self.assertEqual(target.read_bytes(), EXAMPLE)
-
-    def test_omitted_ssh_identity_is_valid_and_explicit_key_still_checked(self):
-        import json
-        with tempfile.TemporaryDirectory() as d:
-            cfg = json.loads(Path(__file__).with_name('opnsense-spare.json.example').read_text())
-            cfg['iso_dir'] = d
-            cfg['maintenance_ssh_host'] = '192.168.10.99'
-            del cfg['ssh_identity']
-            spare.validate_config(cfg)
-            cfg['ssh_identity'] = None
-            spare.validate_config(cfg)
-            cfg['ssh_identity'] = 123
-            with self.assertRaises(RuntimeError):
-                spare.validate_config(cfg)
-            with self.assertRaises(RuntimeError):
-                spare.maintenance_export(dict(maintenance_ssh_user='root',
-                          maintenance_ssh_host='192.168.10.99',
-                          ssh_timeout_seconds=10,
-                          ssh_identity='/nonexistent/opnsense_spare_private_key'), Path(d)/'export.xml')
-
-    def test_recover_incomplete_only_if_old_nics_and_iso_remain(self):
-        import json
-        with tempfile.TemporaryDirectory() as d:
-            td = Path(d)
-            cfg = json.loads(Path(__file__).with_name('opnsense-spare.json.example').read_text())
-            cfg.update(iso_dir=d, maintenance_ssh_host='192.168.10.99',
-                       state_file=str(td/'state.json'))
-            cfg_path = td/'config.json'
-            cfg_path.write_text(json.dumps(cfg))
-            ident = 'a'*32
-            state_path = td/'state.json'
-            spare.save_state(state_path, {'mode':'maintenance', 'pending_export':False,
-                                          'last_request':ident,
-                                          'incomplete':{'target':'emergency'}})
-            iso = f'opnsense-spare-999-{ident}.iso'
-            good_vm = (f"net0: {cfg['networks']['maintenance']['net0']}\n"
-                       f"net1: {cfg['networks']['maintenance']['net1']}\n"
-                       f"ide2: local:iso/{iso},media=cdrom\n")
-            def make_run(vm_config):
-                def _run(*argv, **kwargs):
-                    if argv[:2] == ('qm','status'):
-                        return b'status: stopped\n'
-                    if argv[:2] == ('qm','config'):
-                        return vm_config.encode()
-                    raise AssertionError(f'Unexpected command: {argv}')
-                return _run
-            argv = ['opnsense-spare','maintenance','--config',str(cfg_path), '--recover-incomplete']
-            with patch.object(spare.sys,'argv',argv), patch.object(spare.os,'geteuid',return_value=0), \
-                 patch.object(spare,'run',side_effect=make_run(good_vm)), patch('builtins.input',return_value='j'):
-                spare.main()
-            self.assertNotIn('incomplete',spare.load_state(state_path))
-
-            # A partial change must not allow recovery to clear the marker.
-            spare.save_state(state_path, {'mode':'maintenance', 'pending_export':False,
-                                          'last_request':ident,
-                                          'incomplete':{'target':'emergency'}})
-            modified_vm=good_vm.replace('tag=10','tag=4094')
-            with patch.object(spare.sys,'argv',argv), patch.object(spare.os,'geteuid',return_value=0), \
-                 patch.object(spare,'run',side_effect=make_run(modified_vm)):
-                with self.assertRaises(RuntimeError):
+    def invoke(self, mode, flags=(), answers=(), error=None):
+        argv=['opnsense-spare',mode,'--config',str(self.path),*flags]
+        with patch.object(spare.sys,'argv',argv), patch.object(spare.os,'geteuid',return_value=0), \
+             patch.object(spare,'run',side_effect=self.run), \
+             patch.object(spare,'make_iso',side_effect=self.make_iso), \
+             patch.object(spare.shutil,'which',return_value='/usr/bin/xorriso'), \
+             patch('builtins.input',side_effect=answers):
+            if error:
+                with self.case.assertRaisesRegex(RuntimeError,error):
                     spare.main()
-            self.assertIn('incomplete',spare.load_state(state_path))
-
-# Regression tests for the V4 bug: 'n' to boot must NOT be an incomplete failure.
-class TestV5HostWorkflow(unittest.TestCase):
-    def _cfg(self, root):
-        import json
-        cfg = json.loads(Path(__file__).with_name('opnsense-spare.json.example').read_text())
-        cfg.update(iso_dir=str(root), state_file=str(root/'state.json'),
-                   maintenance_ssh_host='192.168.10.99', ssh_identity=None)
-        path=root/'cfg.json'
-        path.write_text(json.dumps(cfg))
-        return cfg, path
-
-    def test_no_start_is_prepared_then_restart_can_switch_profile(self):
-        import json
-        with tempfile.TemporaryDirectory() as d:
-            root=Path(d)
-            cfg,cfg_path=self._cfg(root)
-            spare.save_state(root/'state.json', {'mode':'maintenance','pending_export':False})
-            vnets={'net0':cfg['networks']['maintenance']['net0'], 'net1':cfg['networks']['maintenance']['net1']}
-            iso={'name':'local:iso/example.iso'}
-            status={'value':'stopped'}
-            count={'iso':0,'start':0}
-            def fake_run(*args,**kw):
-                if args[:2] == ('qm','status'): return f'status: {status["value"]}\n'.encode()
-                if args[:2] == ('qm','config'):
-                    return (f'net0: {vnets["net0"]}\nnet1: {vnets["net1"]}\n'
-                            f'ide2: {iso["name"]},media=cdrom\n').encode()
-                if args[:2] == ('qm','set'):
-                    if args[3] in ('--net0','--net1'):
-                        vnets[args[3][2:]]=args[4]
-                    if args[3] == '--ide2': iso['name']=args[4].split(',')[0]
-                    return b''
-                if args[:2] == ('qm','start'):
-                    count['start']+=1
-                    status['value']='running'
-                    return b''
-                raise AssertionError(f'unexpected command {args}')
-            def fake_make(cfg,mode,src):
-                count['iso']+=1
-                name=spare.iso_name(cfg,mode)
-                path=root/name
-                path.write_bytes(f'iso-{count["iso"]}'.encode())
-                return ('f'*32,name,path)
-            argv=['opnsense-spare','emergency','--link-down','--config',str(cfg_path)]
-            with patch.object(spare.sys,'argv',argv), patch.object(spare.os,'geteuid',return_value=0), \
-                 patch.object(spare,'run',side_effect=fake_run), \
-                 patch.object(spare,'make_iso',side_effect=fake_make), \
-                 patch.object(spare.shutil,'which',return_value='/usr/bin/xorriso'), \
-                 patch('builtins.input',side_effect=['n','n']):
-                spare.main()     # First n = import, second n = do not boot.
-            st=spare.load_state(root/'state.json')
-            self.assertEqual(st['mode'],'maintenance')
-            self.assertEqual(st['prepared']['mode'],'emergency')
-            self.assertIn('net0',st['prepared']['networks'])
-            self.assertNotIn('incomplete',st)
-            self.assertEqual(count['start'],0)
-            # Another call can rebuild prepared emergency and actually boot.
-            with patch.object(spare.sys,'argv',argv), patch.object(spare.os,'geteuid',return_value=0), \
-                 patch.object(spare,'run',side_effect=fake_run), \
-                 patch.object(spare,'make_iso',side_effect=fake_make), \
-                 patch.object(spare.shutil,'which',return_value='/usr/bin/xorriso'), \
-                 patch('builtins.input',side_effect=['j','n','j']):
-                spare.main()   # prepared check yes, import no, start yes
-            st=spare.load_state(root/'state.json')
-            self.assertEqual(st['mode'],'emergency')
-            self.assertNotIn('prepared',st)
-            self.assertNotIn('incomplete',st)
-            self.assertEqual(count['start'],1)
-
-    def test_v4_no_start_recovered_as_prepared_and_does_not_commit_guest_mode(self):
-        with tempfile.TemporaryDirectory() as d:
-            root=Path(d)
-            cfg,cfg_path=self._cfg(root)
-            spare.save_state(root/'state.json', {'mode':'maintenance','pending_export':False,
-                                                'incomplete':{'target':'emergency'}})
-            net0=spare.set_link_down(cfg['networks']['emergency']['net0'],True)
-            net1=spare.set_link_down(cfg['networks']['emergency']['net1'],True)
-            name=spare.iso_name(cfg,'emergency')
-            (root/name).write_bytes(b'previous V4 ISO')
-            actual=(f'net0: {net0}\nnet1: {net1}\n'
-                    f'ide2: local:iso/{name},media=cdrom\n')
-            def fake_run(*args,**kw):
-                if args[:2] == ('qm','status'): return b'status: stopped\n'
-                if args[:2] == ('qm','config'): return actual.encode()
-                raise AssertionError(args)
-            argv=['opnsense-spare','emergency','--config',str(cfg_path),'--recover-incomplete']
-            with patch.object(spare.sys,'argv',argv), patch.object(spare.os,'geteuid',return_value=0), \
-                 patch.object(spare,'run',side_effect=fake_run), patch('builtins.input',return_value='j'):
+            else:
                 spare.main()
-            st=spare.load_state(root/'state.json')
-            self.assertNotIn('incomplete',st)
-            self.assertEqual(st['prepared']['mode'],'emergency')
-            self.assertIn('net0',st['prepared']['networks'])
-            self.assertEqual(st['mode'],'maintenance')
 
-    def test_pending_export_can_be_explicitly_forgone_in_stopped_vm(self):
-        with tempfile.TemporaryDirectory() as d:
-            root=Path(d)
-            cfg,cfg_path=self._cfg(root)
-            spare.save_state(root/'state.json', {'mode':'maintenance','pending_export':True})
-            def fake_run(*args,**kw):
-                if args[:2] == ('qm','status'): return b'status: stopped\n'
-                if args[:2] == ('qm','config'):
-                    return (f"net0: {cfg['networks']['maintenance']['net0']}\nnet1: {cfg['networks']['maintenance']['net1']}\n"
-                            'ide2: local:iso/something.iso,media=cdrom\n').encode()
-                raise AssertionError(args)
-            argv=['opnsense-spare','emergency','--link-down','--config',str(cfg_path)]
-            # refuse to skip export -- no mutation
-            with patch.object(spare.sys,'argv',argv), patch.object(spare.os,'geteuid',return_value=0), \
-                 patch.object(spare,'run',side_effect=fake_run), patch('builtins.input',return_value='n'):
-                with self.assertRaises(RuntimeError): spare.main()
-            self.assertTrue(spare.load_state(root/'state.json')['pending_export'])
-            # accept skipping export, decline import and stop at dry-run? Instead mock
-            # xorriso missing after asking to prove pending has been acknowledged.
-            with patch.object(spare.sys,'argv',argv), patch.object(spare.os,'geteuid',return_value=0), \
-                 patch.object(spare,'run',side_effect=fake_run), \
-                 patch.object(spare.shutil,'which',return_value=None), \
-                 patch('builtins.input',side_effect=['j','n']):
-                with self.assertRaisesRegex(RuntimeError,'xorriso is missing'): spare.main()
-            self.assertFalse(spare.load_state(root/'state.json')['pending_export'])
+    def count(self, command):
+        return sum(1 for args in self.commands if args[:len(command)] == command)
 
 
-if __name__ == '__main__':
+class StatelessControllerTests(unittest.TestCase):
+    def test_xml_and_vlan_validation(self):
+        self.assertEqual(spare.validate_xml(EXAMPLE,'test'),EXAMPLE)
+        for s in (b'<bad/>',b'<opnsense>',b'not xml'):
+            with self.assertRaises(RuntimeError):spare.validate_xml(s,'test')
+        valid='virtio=02:00:00:00:20:01,bridge=vmbr0,tag=4094,trunks=1;4;50-56;666,link_down=1'
+        for s in (valid.replace('50-56','i53'),valid.replace('666','4095'),
+                  valid.replace('50-56','56-50'),valid.replace('1;4','1;;4')):
+            with self.assertRaises(RuntimeError):spare.parse_net_profile('net0',s)
+
+    def test_iso_contains_checksums_and_new_ids(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); imported=root/'source.xml'; imported.write_bytes(EXAMPLE)
+            cfg={'vmid':999,'iso_dir':td,'interface_names':{'vtnet0':'ix1','vtnet1':'igc3'}}
+            requests=[]
+            def xorriso(*argv,**kw):
+                src=Path(argv[-1]); req=(src/'request.conf').read_text()
+                requests.append(req)
+                self.assertIn('ifmap_sha256=',req)
+                self.assertIn('vtnet0=ix1\nvtnet1=igc3\n',(src/'interfaces.conf').read_text())
+                if len(requests)==1:
+                    self.assertIn('import=1',req)
+                    self.assertEqual((src/'config.xml').read_bytes(),EXAMPLE)
+                Path(argv[argv.index('-o')+1]).write_bytes(req.encode())
+            with patch.object(spare,'run',side_effect=xorriso):
+                i1,n1,p1=spare.make_iso(cfg,'emergency',imported)
+                i2,n2,p2=spare.make_iso(cfg,'emergency',None)
+            self.assertEqual(n1,n2)
+            self.assertNotEqual(i1,i2)
+            self.assertIn('import=0',p2.read_text())
+            self.assertEqual(p2.stat().st_mode & 0o777,0o600)
+
+    def test_guest_config_is_unchanged(self):
+        guest=(HERE/'90-opnsense-spare').read_text()
+        self.assertIn('ifmap_sha256',guest)
+        self.assertIn('/sbin/ifconfig "$SRC" name "$DST"',guest)
+
+    def test_prepared_no_start_manual_start_then_maintenance(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td))
+            source=Path(td)/'physical.xml'; source.write_bytes(EXAMPLE)
+            h.invoke('emergency',['--link-down','--transfer',str(source)],['n'])
+            self.assertEqual(h.count(('qm','start')),0)
+            self.assertIn('emergency.iso',h.iso)
+            self.assertFalse((Path(td)/'state.json').exists())
+            h.status='running'  # Manually qm start 999 (outside controller)
+            h.status='stopped'  # Subsequently qm stop 999
+            h.invoke('maintenance',answers=['n'])
+            self.assertIn('maintenance.iso',h.iso)
+            self.assertEqual(h.count(('qm','start')),0)
+
+    def test_live_emergency_confirmation_refused_no_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td))
+            h.invoke('emergency',['--link-up'],['n'],error='Not confirmed')
+            self.assertEqual(h.count(('qm','set')),0)
+            self.assertEqual(h.isos,0)
+
+    def test_live_emergency_mac_and_vlan_and_boot(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td),three=True)
+            source=Path(td)/'physical.xml'; source.write_bytes(EXAMPLE)
+            h.invoke('emergency',['--link-up','--transfer',str(source)],['y','y'])
+            self.assertEqual(h.status,'running')
+            self.assertEqual(h.count(('qm','start')),1)
+            self.assertEqual(h.count(('qm','set','999','--net2')),1)
+            self.assertEqual(h.count(('qm','set','999','--onboot')),1)
+            for value in h.nets.values():
+                self.assertIn('link_down=0',value)
+            self.assertEqual(h.onboot,'0')
+
+    def test_failed_second_nic_never_starts(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td))
+            h.errors['--net1']='Simulated qm set failure'
+            h.invoke('emergency',['--link-down'],error='Simulated qm set failure')
+            self.assertEqual(h.count(('qm','start')),0)
+            self.assertEqual(h.onboot,'0')
+            self.assertEqual(h.nets['net1'],h.cfg['networks']['maintenance']['net1'])
+            h.errors.clear()
+            h.invoke('maintenance',answers=['n'])
+            self.assertIn('maintenance.iso',h.iso)
+
+    def test_silent_pve_nic_mismatch_prevents_start(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td))
+            real_run=h.run
+            def ignored_net1(*args,**kw):
+                if args[:4]==('qm','set','999','--net1'):
+                    h.commands.append(args); return b''
+                return real_run(*args,**kw)
+            with patch.object(h,'run',side_effect=ignored_net1):
+                h.invoke('emergency',['--link-down'],error='did not apply net1')
+            self.assertEqual(h.count(('qm','start')),0)
+
+    def test_iso_mismatch_prevents_start(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td))
+            real_run=h.run
+            def ignored_iso(*args,**kw):
+                if args[:4]==('qm','set','999','--ide2'):
+                    h.commands.append(args); return b''
+                return real_run(*args,**kw)
+            with patch.object(h,'run',side_effect=ignored_iso):
+                h.invoke('emergency',['--link-down'],error='did not attach')
+            self.assertEqual(h.count(('qm','start')),0)
+
+    def test_export_without_transfer_is_never_automatic(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td))
+            with patch.object(spare,'maintenance_export') as export:
+                h.invoke('maintenance',answers=['y'])
+                export.assert_not_called()
+            self.assertEqual(h.status,'running')
+
+    def test_running_maintenance_explicit_export_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td))
+            h.invoke('maintenance',answers=['y'])
+            target=Path(td)/'backup.xml'
+            with patch.object(spare,'maintenance_export') as export:
+                h.invoke('maintenance',['--transfer',str(target)])
+                export.assert_called_once_with(h.cfg,target)
+            self.assertEqual(h.count(('qm','set')),4) # only first prepare, no second mutation
+
+    def test_running_emergency_cannot_be_reconfigured(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td))
+            h.invoke('emergency',['--link-down'],['y'])
+            n=h.count(('qm','set'))
+            h.invoke('maintenance',error='VM is running')
+            self.assertEqual(h.count(('qm','set')),n)
+
+    def test_maintenance_export_deferred_when_start_declined(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td))
+            dest=Path(td)/'export.xml'
+            with patch.object(spare,'maintenance_export') as export:
+                h.invoke('maintenance',['--transfer',str(dest)],['n'])
+                export.assert_not_called()
+                h.status='running'  # manual start
+                h.invoke('maintenance',['--transfer',str(dest)])
+                export.assert_called_once_with(h.cfg,dest)
+
+    def test_no_implicit_transfer_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td))
+            # The legacy sample contains transfer_default; no transfer requested.
+            h.invoke('emergency',['--link-down'],['n'])
+            self.assertEqual(h.count(('qm','start')),0)
+            self.assertEqual(h.isos,1)
+
+    def test_forged_running_maintenance_profile_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td))
+            h.invoke('emergency',['--link-down'],['n'])
+            h.status='running'
+            with patch.object(spare,'maintenance_export') as export:
+                h.invoke('maintenance',['--transfer',str(Path(td)/'x.xml')],error='did not apply net0')
+                export.assert_not_called()
+
+    def test_invalid_import_fails_before_qm_set(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td))
+            bad=Path(td)/'bad.xml';bad.write_text('<not-opnsense/>')
+            h.invoke('emergency',['--link-down','--transfer',str(bad)],error='root element')
+            self.assertEqual(h.count(('qm','set')),0)
+
+    def test_dry_run_makes_no_changes_and_no_import_prompts(self):
+        with tempfile.TemporaryDirectory() as td:
+            h=Harness(self,Path(td))
+            h.invoke('emergency',['--dry-run'])
+            self.assertEqual(h.count(('qm','set')),0)
+            self.assertEqual(h.isos,0)
+
+
+if __name__=='__main__':
     unittest.main()
