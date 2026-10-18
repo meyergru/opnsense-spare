@@ -1,0 +1,27 @@
+{
+  "vmid": 999,
+  "iso_dir": "/var/lib/vz/template/iso",
+  "iso_storage": "local",
+  "state_file": "/var/lib/opnsense-spare/state.json",
+  "transfer_default": "/root/opnsense-transfer/config.xml",
+  "maintenance_ssh_host": "192.0.2.10",
+  "maintenance_ssh_user": "root",
+  "ssh_identity": null,
+  "ssh_timeout_seconds": 90,
+  "maintenance_client_nic": "net0",
+  "interface_names": {
+    "vtnet0": "ix1",
+    "vtnet1": "igc3"
+  },
+  "networks": {
+    "maintenance": {
+      "net0": "virtio=02:00:00:00:10:01,bridge=vmbr0,tag=10,firewall=0",
+      "net1": "virtio=02:00:00:00:10:02,bridge=vmbr0,link_down=1,firewall=0"
+    },
+    "emergency": {
+      "net0": "virtio=02:00:00:00:20:01,bridge=vmbr0,tag=4094,trunks=1;7;10;52;55;56,firewall=0",
+      "net1": "virtio=02:00:00:00:20:02,bridge=vmbr0,tag=41,trunks=40,firewall=0"
+    }
+  },
+  "emergency_instructions": "Power off the physical OPNsense and move the ONT cable to the designated WAN port."
+}
