@@ -35,6 +35,8 @@ class Harness:
 
     def run(self, *cmd, **kw):
         self.commands.append(cmd)
+        if cmd[:2] == ('pvesm', 'path'):
+            return str(self.root / cmd[2].split('/')[-1]).encode()
         if cmd[:2] == ('qm', 'status'):
             return f'status: {self.status}\n'.encode()
         if cmd[:2] == ('qm', 'config'):
@@ -188,6 +190,52 @@ class StatelessControllerTests(unittest.TestCase):
             with patch.object(h,'run',side_effect=ignored_iso):
                 h.invoke('emergency',['--link-down'],error='did not attach')
             self.assertEqual(h.count(('qm','start')),0)
+
+    def test_export_rejects_directory_without_ssh_or_vm_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            h = Harness(self, Path(td))
+            with self.assertRaisesRegex(RuntimeError, "regular file"):
+                spare.validate_export_destination(Path(td))
+            with patch.object(spare.subprocess, 'run') as ssh:
+                with self.assertRaisesRegex(RuntimeError, "regular file"):
+                    spare.maintenance_export(h.cfg, Path(td))
+                ssh.assert_not_called()
+            h.invoke('maintenance', ['--transfer', td], error='regular file')
+            self.assertEqual(h.count(('qm', 'set')), 0)
+
+    def test_iso_storage_resolves_to_generated_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = {'iso_dir': td, 'iso_storage': 'local'}
+            iso = 'opnsense-spare-999-maintenance.iso'
+            with patch.object(spare, 'run', return_value=(td+'/'+iso+'\\n').encode()):
+                self.assertEqual(spare.verify_iso_storage(cfg, iso), 'local:iso/'+iso)
+            with patch.object(spare, 'run', return_value=b'/wrong/location.iso\\n'):
+                with self.assertRaisesRegex(RuntimeError, 'ISO storage mismatch'):
+                    spare.verify_iso_storage(cfg, iso)
+
+    def test_non_cdrom_ide2_rejected(self):
+        spare.verify_optical_slot('ide2: local:iso/test.iso,media=cdrom\\n')
+        spare.verify_optical_slot('net0: virtio=02:00:00:00:00:01\\n')
+        with self.assertRaisesRegex(RuntimeError, 'non-CD-ROM'):
+            spare.verify_optical_slot('ide2: local-lvm:vm-999-disk-0,size=8G\\n')
+
+    def test_export_replacement_preserves_old_file_during_staging_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            dest = root / 'out.xml'
+            dest.write_bytes(EXAMPLE)
+            bad = b'<?xml version="1.0"?><opnsense><other/></opnsense>'
+            cfg = Harness(self, root).cfg
+            def fake_ssh(*args, **kwargs):
+                p = MagicMock()
+                p.returncode = 0
+                p.stdout = bad
+                return p
+            with patch.object(spare.subprocess, 'run', side_effect=fake_ssh), \\
+                 patch.object(spare.os, 'fdopen', side_effect=OSError('disk full')):
+                with self.assertRaisesRegex(OSError, 'disk full'):
+                    spare.maintenance_export(cfg, dest)
+            self.assertEqual(dest.read_bytes(), EXAMPLE)
 
     def test_export_without_transfer_is_never_automatic(self):
         with tempfile.TemporaryDirectory() as td:
