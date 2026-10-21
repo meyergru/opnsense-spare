@@ -34,9 +34,41 @@ The VM maintains separate profiles:
 
 On a mode change, the previous active configuration is preserved before activating the target profile. A new emergency import replaces the emergency profile, archiving its previous version when present. Configuration import is **entirely local**; it works with `link_down=1` and does not require guest SSH or network connectivity. **Only the optional failback export uses SSH**, after the VM has started in maintenance mode.
 
+## Operating modes and network identity
+
+The controller supports **two guest operating modes**: maintenance and emergency. Disconnecting emergency NICs for an isolated test, preparing a stopped VM, and transferring a configuration are **not additional modes**.
+
+| Situation | Physical firewall | Spare VM identity and network access |
+|---|---|---|
+| **Maintenance (running)** | Remains online | Independent LAN IP and MAC; only the configured maintenance-client NIC is connected. Other VM NICs are disconnected. Both machines can run simultaneously. |
+| **Emergency, isolated test (`--link-down`)** | May remain online | Guest loads its emergency profile with the production IP and MAC settings, but **all VM NIC links are down**. No external traffic is possible through those NICs. |
+| **Emergency, live (`--link-up`)** | Must be powered off or fully isolated | Guest uses the original firewall's IP and MAC addresses, with the configured production network paths. It replaces the physical firewall; never operate both concurrently on those networks. |
+| **Prepared, VM stopped** | Depends on the intended cutover | PVE NICs and the selected mode ISO are configured, but the VM generates no traffic. You may later use `qm start <VMID>` manually. |
+
+Conceptual traffic paths (actual cabling, bridges and VLANs vary):
+
+```text
+NORMAL / MAINTENANCE
+
+LAN clients ---- LAN / switch ---- Physical OPNsense ---- WAN / ISP
+                    |
+                    +---- Spare VM (independent LAN client)
+
+
+LIVE EMERGENCY
+
+LAN clients ---- LAN / switch ---- Spare OPNsense VM ---- WAN / ISP
+
+Physical OPNsense: powered off or completely isolated
+```
+
+**Configuration transfer is an optional action, not a state.** An explicit `emergency --transfer PATH` adds a physical-firewall backup to the emergency ISO for import on the next guest boot. An explicit `maintenance --transfer PATH` exports the guest's saved emergency profile after maintenance has booted (or while a verified maintenance VM is running). Without `--transfer`, neither operation is implied.
+
 ## Network requirements and topology
 
 The controller is **independent of any switch vendor and does not require VLANs**. Each physical firewall network must, however, have an equivalent and isolated Layer-2 path to its corresponding VM NIC. You can use dedicated PVE bridges and physical adapters, VLAN trunks, or a combination.
+
+**Single source of truth for host-side network profiles:** `/etc/opnsense-spare.json` defines the expected VM NIC slots, physical-to-VirtIO interface-name mapping, maintenance and emergency MAC addresses, bridges, VLAN handling, and maintenance NIC isolation. The controller validates these settings before applying them and does not maintain a second persistent copy of the VM's mode. This makes the JSON a suitable input for configuration management (for example Ansible). It is **not** the source of truth for the guest's IP addresses, firewall rules, VPN credentials, or runtime state: OPNsense stores its configuration profiles, and Proxmox reports the actual VM hardware/status.
 
 Supported interface mapping example:
 
@@ -145,6 +177,7 @@ The controller uses two stable ISO filenames (`opnsense-spare-<VMID>-maintenance
 - Emergency switching is manual by design. `onboot=0` is enforced.
 - Validate the PVE bridge wiring, VLAN tagging/untagging, WAN connectivity (DHCP or PPPoE), gateway, routing, DHCP, VPN, and firewall behavior for *your* topology.
 - The mode ISO may contain a complete firewall configuration, **including secrets**. The controller creates the ISO with permission `0600`; protect PVE backups, snapshots, transfer files, and any old ISO images accordingly.
+- **Configuration-data logging:** The controller does not intentionally print the imported/exported `config.xml` body. It reports file paths, operations and (on successful export) a SHA-256 checksum. Keep source backups, export files and their directories private (for example `0600` files inside `0700` directories); SSH error diagnostics may contain text from the remote endpoint and should be handled accordingly.
 - The guest hook fails closed on absent/invalid media, invalid mapping, source-name conflicts, unexpected boot-hook failures, or an interrupted profile transition. A transition interrupted after configuration activation requires manual investigation using the OPNsense console; the marker is intentionally not cleared automatically. This may halt the VM and require console recovery.
 - An older EFI loader can fail before OPNsense hooks run. Verify loader compatibility after major upgrades.
 
